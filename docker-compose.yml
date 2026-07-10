@@ -1,0 +1,7 @@
+services:
+  open-archicad:
+    build: .
+    container_name: open-archicad
+    ports:
+      - "8080:80"
+    restart: unless-stopped

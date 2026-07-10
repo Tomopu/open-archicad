@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Open ArchiCAD — 軽量建築CAD</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📐</text></svg>" />
+</head>
+<body>
+  <div id="app">
+    <header id="topbar">
+      <div class="brand">Open<span>Archi</span>CAD</div>
+      <div class="menu" id="file-menu">
+        <button data-cmd="new" title="新規作成">新規</button>
+        <button data-cmd="open" title="ファイルを開く (.oarc.json / .dxf)">開く</button>
+        <button data-cmd="save" title="プロジェクトを保存 (.oarc.json)">保存</button>
+        <span class="sep"></span>
+        <button data-cmd="export-dxf" title="AutoCAD 互換 DXF 書き出し">DXF書出</button>
+        <button data-cmd="export-obj" title="Blender / SketchUp 互換 OBJ 書き出し">OBJ書出</button>
+        <button data-cmd="export-gltf" title="Blender 互換 glTF 書き出し">glTF書出</button>
+        <span class="sep"></span>
+        <button data-cmd="undo" title="元に戻す (⌘Z)">↩</button>
+        <button data-cmd="redo" title="やり直し (⇧⌘Z)">↪</button>
+      </div>
+      <div id="floor-bar">
+        <div id="floor-tabs" title="クリック: 階を切替 / ダブルクリック: 名前変更 / 右クリック: 削除"></div>
+        <button id="floor-add" title="階を追加">＋</button>
+        <label id="ghost-toggle-wrap" title="下階の壁・柱・階段を透かして表示">
+          <input type="checkbox" id="ghost-toggle" checked> 下階を透かす
+        </label>
+        <button id="copy-below" title="下階の壁・柱をこの階に複製">下階の壁をコピー</button>
+      </div>
+      <div class="tabs">
+        <button id="tab-2d" class="tab active">平面図</button>
+        <button id="tab-3d" class="tab">3D</button>
+      </div>
+    </header>
+
+    <div id="main">
+      <div id="canvas-area">
+        <canvas id="canvas2d"></canvas>
+        <div id="view3d" hidden>
+          <div id="view3d-toolbar">
+            <button id="btn3d-rot" title="回転リング(自由回転、45°吸着)">回転</button>
+            <button id="btn3d-del" title="選択を削除 (Del)">削除</button>
+            <span class="sep"></span>
+            <button id="btn3d-measure" title="2点間の距離を計測">計測</button>
+            <button id="btn3d-png" title="現在のビューを PNG 画像で保存">PNG</button>
+            <span class="sep"></span>
+            <span class="hint">視点:</span>
+            <button data-view="top" title="上面図">上</button>
+            <button data-view="front" title="正面">正</button>
+            <button data-view="side" title="側面">横</button>
+            <button data-view="iso" title="鳥瞰">鳥</button>
+            <span class="sep"></span>
+            <label class="hint" style="display:flex;align-items:center;gap:3px">
+              <input type="checkbox" id="chk3d-upper" checked> 上階
+            </label>
+            <label class="hint" style="display:flex;align-items:center;gap:3px" title="X(赤)・Y(緑)・Z(青)軸を表示">
+              <input type="checkbox" id="chk3d-axes"> 軸
+            </label>
+            <label class="hint" style="display:flex;align-items:center;gap:3px" title="地面とグリッドの表示">
+              <input type="checkbox" id="chk3d-ground" checked> 地面
+            </label>
+            <button id="btn-rebuild3d" title="3Dモデルを再生成">再生成</button>
+          </div>
+        </div>
+        <div id="hint-bar"></div>
+        <div id="scale-bar" title="縮尺">
+          <div class="segs"></div>
+          <div class="label"></div>
+        </div>
+        <div id="obj-actions" hidden>
+          <button data-act="rotate" title="90°回転 (R)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 11a8.5 8.5 0 1 0-2.2 7"/><path d="M21 4.5V11h-6.5"/></svg></button>
+          <button data-act="dup" title="複製"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
+          <button data-act="group" title="グループ化 / 解除"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="8" height="8" rx="1.5"/><rect x="13" y="13" width="8" height="8" rx="1.5"/><path d="M11 7h4a2 2 0 0 1 2 2v4M13 17H9a2 2 0 0 1-2-2v-4" stroke-dasharray="2.5 2"/></svg></button>
+          <button data-act="del" title="削除 (Del)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M10 7V5a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v2M6.5 7l.8 12a1 1 0 0 0 1 .9h7.4a1 1 0 0 0 1-.9l.8-12M10 11v5M14 11v5"/></svg></button>
+        </div>
+        <div id="dim-chips" hidden></div>
+
+        <!-- サイドメニューはキャンバスの上に重なる(リサイズしても図面はそのまま) -->
+        <aside id="left-panel" class="panel">
+          <div class="panel-title">ツール</div>
+          <div id="tool-palette" class="tool-grid"></div>
+          <div class="panel-title">ツール設定</div>
+          <div id="tool-options" class="props"></div>
+          <div class="panel-title">コンポーネント
+            <span class="title-actions">
+              <button id="comp-make" title="選択中の要素をコンポーネント化">＋作成</button>
+              <button id="comp-studio" title="部品スタジオ: プリミティブの合成・くり抜きで 3D 部品を作る">3D作成</button>
+              <button id="comp-import" title="コンポーネント読込 (.json)">読込</button>
+            </span>
+          </div>
+          <div id="component-list" class="comp-list"></div>
+        </aside>
+        <div class="splitter" id="split-left"></div>
+        <button id="toggle-left" class="panel-toggle" title="メニューを表示" hidden>☰</button>
+
+        <aside id="right-panel" class="panel">
+          <div class="panel-title">プロパティ</div>
+          <div id="properties" class="props"><div class="empty">要素を選択してください</div></div>
+          <div class="panel-title">プロジェクト設定</div>
+          <div id="project-settings" class="props"></div>
+          <div class="panel-title">リーガルチェック
+            <span class="title-actions">
+              <button id="legal-run">実行</button>
+              <button id="legal-clear" title="ハイライトを消す">クリア</button>
+            </span>
+          </div>
+          <div id="legal-results" class="legal"></div>
+        </aside>
+        <div class="splitter" id="split-right"></div>
+        <button id="toggle-right" class="panel-toggle" title="メニューを表示" hidden>☰</button>
+      </div>
+    </div>
+
+    <footer id="statusbar">
+      <span id="st-coords">x: 0, y: 0</span>
+      <span class="sep"></span>
+      <label>スナップ
+        <select id="st-snap">
+          <option value="455">455 (半モジュール)</option>
+          <option value="910">910 (1モジュール)</option>
+          <option value="100">100</option>
+          <option value="10">10</option>
+          <option value="0">なし</option>
+        </select>
+      </label>
+      <label><input type="checkbox" id="st-grid" checked> グリッド</label>
+      <label>グリッド幅 <input type="number" id="st-gridstep" value="910" min="10" step="5" style="width:60px"> mm</label>
+      <label title="壁厚の自動表記 (t=120)"><input type="checkbox" id="st-wallt" checked> 壁厚</label>
+      <span class="spacer"></span>
+      <span id="st-zoom">100%</span>
+      <span id="st-msg"></span>
+    </footer>
+  </div>
+  <input type="file" id="file-input" hidden />
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

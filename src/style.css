@@ -1,0 +1,287 @@
+/* Open ArchiCAD — 白基調ミニマル UI */
+:root {
+  --bg: #ffffff;
+  --bg2: #fafafa;
+  --border: #e5e5e5;
+  --text: #1a1a1a;
+  --text2: #737373;
+  --accent: #2563eb;
+  --accent-bg: #eff6ff;
+  --danger: #dc2626;
+  --warn: #d97706;
+  --ok: #16a34a;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body, #app { height: 100%; overflow: hidden; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Noto Sans JP", sans-serif;
+  font-size: 12px; color: var(--text); background: var(--bg);
+  -webkit-font-smoothing: antialiased; user-select: none;
+}
+#app { display: flex; flex-direction: column; }
+
+/* ---- top bar ---- */
+#topbar {
+  display: flex; align-items: center; gap: 16px; padding: 0 12px; height: 40px;
+  border-bottom: 1px solid var(--border); background: var(--bg); flex: none;
+}
+.brand { font-weight: 700; font-size: 13px; letter-spacing: .02em; }
+.brand span { color: var(--accent); }
+.menu { display: flex; align-items: center; gap: 2px; }
+.menu .sep, #statusbar .sep { width: 1px; height: 16px; background: var(--border); margin: 0 6px; }
+button {
+  font: inherit; color: var(--text); background: transparent; border: 1px solid transparent;
+  border-radius: 5px; padding: 4px 8px; cursor: pointer; white-space: nowrap;
+}
+button:hover { background: var(--bg2); border-color: var(--border); }
+button.active { background: var(--accent-bg); color: var(--accent); border-color: #bfdbfe; }
+/* ---- 階タブ ---- */
+#floor-bar { margin-left: auto; display: flex; align-items: center; gap: 4px; }
+#floor-tabs { display: flex; gap: 2px; background: var(--bg2); border-radius: 6px; padding: 2px; }
+#floor-tabs button { padding: 3px 12px; border-radius: 5px; color: var(--text2); }
+#floor-tabs button.active { background: #fff; color: var(--text); box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+#floor-add { color: var(--text2); padding: 3px 8px; }
+#ghost-toggle-wrap { display: flex; align-items: center; gap: 4px; color: var(--text2); font-size: 11px; white-space: nowrap; }
+#copy-below { font-size: 11px; color: var(--text2); }
+
+.tabs { display: flex; gap: 2px; background: var(--bg2); border-radius: 6px; padding: 2px; }
+.tab { padding: 3px 14px; border-radius: 5px; color: var(--text2); }
+.tab.active { background: #fff; color: var(--text); box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+
+/* ---- main layout: キャンバスが全面、サイドメニューはその上に重なる ---- */
+#main { flex: 1; display: flex; min-height: 0; }
+.panel {
+  background: var(--bg); overflow-y: auto; overflow-x: hidden;
+  display: flex; flex-direction: column;
+  position: absolute; top: 0; bottom: 0; z-index: 20;
+}
+#left-panel { left: 0; width: 216px; border-right: 1px solid var(--border); }
+#right-panel { right: 0; width: 260px; border-left: 1px solid var(--border); }
+.panel.collapsed { display: none; }
+.splitter {
+  position: absolute; top: 0; bottom: 0; width: 7px; cursor: col-resize; z-index: 21;
+  touch-action: none;
+}
+.splitter:hover { background: var(--accent-bg); }
+#split-left { left: 216px; margin-left: -3px; }
+#split-right { right: 260px; margin-right: -3px; }
+.panel-toggle {
+  position: absolute; top: 10px; z-index: 22;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  padding: 4px 9px; box-shadow: 0 1px 3px rgba(0,0,0,.07);
+}
+#toggle-left { left: 10px; }
+#toggle-right { right: 10px; }
+.panel-title {
+  font-size: 11px; font-weight: 600; color: var(--text2); padding: 10px 12px 6px;
+  display: flex; align-items: center; justify-content: space-between;
+  border-top: 1px solid var(--border); margin-top: 8px;
+}
+.panel-title:first-child { border-top: none; margin-top: 0; }
+.title-actions button { padding: 1px 6px; font-size: 11px; color: var(--accent); }
+
+/* ---- tool palette ---- */
+.tool-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; padding: 4px 12px; }
+.tool-grid button { display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 7px 2px; border: 1px solid var(--border); }
+.tool-grid button svg { width: 22px; height: 22px; stroke: currentColor; fill: none; stroke-width: 1.4; }
+.tool-grid button .kbd { font-size: 9px; color: var(--text2); }
+
+/* ---- property forms ---- */
+.props { padding: 4px 12px 8px; display: flex; flex-direction: column; gap: 6px; }
+.props .empty { color: var(--text2); padding: 6px 0; }
+.field { display: flex; align-items: center; gap: 6px; }
+.field label { flex: none; width: 74px; color: var(--text2); }
+.field input, .field select, .field textarea {
+  flex: 1; min-width: 0; font: inherit; padding: 3px 6px; border: 1px solid var(--border);
+  border-radius: 5px; background: var(--bg); color: var(--text);
+}
+.field input:focus, .field select:focus { outline: none; border-color: var(--accent); }
+.props .btn-row { display: flex; gap: 4px; flex-wrap: wrap; }
+.props .btn-row button { border: 1px solid var(--border); flex: 1; }
+.props button.danger { color: var(--danger); }
+
+/* ---- components ---- */
+.comp-list { padding: 4px 12px 12px; display: flex; flex-direction: column; gap: 4px; }
+.comp-item { display: flex; align-items: center; gap: 6px; border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; cursor: pointer; }
+.comp-item:hover { background: var(--accent-bg); border-color: #bfdbfe; }
+.comp-item.active { background: var(--accent-bg); border-color: var(--accent); }
+.comp-item .name { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+.comp-item button { padding: 0 4px; color: var(--text2); }
+.comp-list .empty { color: var(--text2); }
+.comp-item input[type=checkbox] { flex: none; }
+.comp-dots { padding: 2px 4px; color: var(--text2); }
+.comp-menu {
+  position: fixed; z-index: 100; min-width: 180px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 8px 30px rgba(0,0,0,.15); padding: 4px; display: flex; flex-direction: column;
+}
+.comp-menu button { text-align: left; padding: 6px 10px; border-radius: 5px; }
+.comp-multibar { display: flex; gap: 4px; }
+.comp-multibar button { border: 1px solid var(--border); flex: 1; font-size: 11px; color: var(--accent); }
+
+/* ---- canvas ---- */
+#canvas-area { flex: 1; position: relative; min-width: 0; background: var(--bg); }
+#canvas2d { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+#view3d { position: absolute; inset: 0; background: #fff; }
+#view3d canvas { display: block; }
+#view3d-toolbar {
+  position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+  z-index: 5; display: flex; gap: 8px; align-items: center;
+  background: rgba(255,255,255,.9); border: 1px solid var(--border); border-radius: 8px; padding: 4px 8px;
+}
+#view3d-toolbar .hint { color: var(--text2); }
+#view3d-toolbar .sep { width: 1px; height: 16px; background: var(--border); }
+#view3d-toolbar button.active { background: var(--accent-bg); color: var(--accent); border-color: #bfdbfe; }
+#hint-bar {
+  position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%);
+  background: rgba(255,255,255,.92); border: 1px solid var(--border); border-radius: 8px;
+  padding: 4px 12px; color: var(--text2); pointer-events: none; white-space: nowrap;
+}
+#hint-bar:empty { display: none; }
+
+/* ---- 縮尺バー(地図スタイル) ---- */
+#scale-bar {
+  position: absolute; bottom: 12px; right: 276px; z-index: 15;
+  background: rgba(255,255,255,.92); border: 1px solid var(--border); border-radius: 6px;
+  padding: 6px 10px; pointer-events: none; transition: right .1s;
+}
+#scale-bar .segs { display: flex; height: 6px; border: 1px solid var(--text); }
+#scale-bar .segs span { height: 100%; }
+#scale-bar .segs span:nth-child(odd) { background: var(--text); }
+#scale-bar .segs span:nth-child(even) { background: #fff; }
+#scale-bar .label { margin-top: 3px; color: var(--text2); font-size: 10px; white-space: nowrap; }
+
+/* ---- 選択オブジェクトのアクションアイコン ---- */
+#obj-actions {
+  position: absolute; z-index: 18; display: flex; gap: 2px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 7px;
+  padding: 2px; box-shadow: 0 2px 8px rgba(0,0,0,.10);
+}
+#obj-actions[hidden] { display: none; }
+#obj-actions button { padding: 6px 9px; line-height: 1; display: flex; align-items: center; color: #404040; }
+#obj-actions button svg { width: 17px; height: 17px; }
+#obj-actions button[data-act="del"] { color: var(--danger); }
+
+/* ---- 選択オブジェクトの寸法チップ(クリックで直接編集) ---- */
+#dim-chips {
+  position: absolute; z-index: 18; display: flex; gap: 4px;
+}
+#dim-chips[hidden] { display: none; }
+#dim-chips .chip {
+  display: flex; align-items: center; gap: 3px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  padding: 2px 6px; box-shadow: 0 2px 8px rgba(0,0,0,.10); font-size: 11px;
+}
+#dim-chips .chip em { font-style: normal; color: var(--text2); font-size: 10px; }
+#dim-chips .chip button {
+  padding: 1px 4px; font-variant-numeric: tabular-nums; color: var(--accent); font-weight: 600;
+}
+#dim-chips .chip input {
+  width: 62px; font: inherit; font-variant-numeric: tabular-nums;
+  border: 1px solid var(--accent); border-radius: 4px; padding: 1px 4px; outline: none;
+}
+
+/* ---- legal ---- */
+.legal { padding: 4px 12px 12px; display: flex; flex-direction: column; gap: 6px; }
+.legal .empty { color: var(--text2); }
+.legal-item { border: 1px solid var(--border); border-left-width: 3px; border-radius: 6px; padding: 6px 8px; }
+.legal-item.ok { border-left-color: var(--ok); }
+.legal-item.warn { border-left-color: var(--warn); }
+.legal-item.error { border-left-color: var(--danger); }
+.legal-item .t { font-weight: 600; display: flex; gap: 6px; align-items: baseline; }
+.legal-item .t .badge { font-size: 10px; }
+.legal-item.ok .badge { color: var(--ok); }
+.legal-item.warn .badge { color: var(--warn); }
+.legal-item.error .badge { color: var(--danger); }
+.legal-item .d { color: var(--text2); margin-top: 2px; }
+.legal-item .ref { color: var(--text2); font-size: 10px; margin-top: 2px; }
+.legal .note { color: var(--text2); font-size: 10px; line-height: 1.5; }
+
+/* ---- カラーピッカー ---- */
+.color-swatch-btn { display: flex; align-items: center; gap: 6px; border: 1px solid var(--border); flex: 1; }
+.color-swatch { width: 14px; height: 14px; border-radius: 3px; border: 1px solid rgba(0,0,0,.15); flex: none; }
+.color-swatch.none { background: linear-gradient(135deg, #fff 45%, #dc2626 45%, #dc2626 55%, #fff 55%); }
+.color-pop {
+  position: fixed; z-index: 100; width: 236px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
+  box-shadow: 0 8px 30px rgba(0,0,0,.15); padding: 10px;
+}
+.cp-section { margin-bottom: 8px; }
+.cp-title { font-size: 10px; color: var(--text2); margin-bottom: 4px; }
+.cp-grid { display: flex; flex-wrap: wrap; gap: 4px; }
+.cp-swatch {
+  width: 18px; height: 18px; border-radius: 4px; padding: 0;
+  border: 1px solid rgba(0,0,0,.15); cursor: pointer;
+}
+.cp-swatch:hover { transform: scale(1.15); }
+.cp-mini { border: 1px solid var(--border); font-size: 10px; padding: 2px 6px; margin-top: 4px; }
+.cp-mini.cp-ok { color: var(--accent); border-color: #bfdbfe; }
+.cp-io { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin-bottom: 0; }
+.cp-io input { font: inherit; font-size: 11px; border: 1px solid var(--border); border-radius: 4px; padding: 2px 4px; }
+.cp-io input[type=color] { width: 26px; height: 24px; padding: 1px; cursor: pointer; }
+
+/* ---- 部品スタジオ ---- */
+.studio-modal {
+  position: fixed; inset: 0; z-index: 200; background: var(--bg);
+  display: flex; flex-direction: column;
+}
+.studio-head {
+  display: flex; align-items: center; gap: 12px; padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.studio-head .hint { color: var(--text2); font-size: 11px; }
+.studio-main { flex: 1; display: flex; min-height: 0; }
+.studio-view { flex: 1; position: relative; }
+.studio-view canvas { display: block; }
+.studio-side { width: 264px; border-left: 1px solid var(--border); overflow-y: auto; }
+.studio-rail {
+  width: 64px; border-right: 1px solid var(--border); display: flex; flex-direction: column;
+  gap: 4px; padding: 8px 6px; align-items: stretch;
+}
+.studio-rail button {
+  display: flex; flex-direction: column; align-items: center; gap: 2px;
+  border: 1px solid var(--border); padding: 7px 2px; font-size: 10px; color: var(--text2);
+}
+.studio-rail button svg { width: 20px; height: 20px; }
+.studio-rail button:hover { color: var(--accent); border-color: #bfdbfe; }
+.studio-actions {
+  position: absolute; z-index: 30; display: flex; gap: 2px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 7px;
+  padding: 2px; box-shadow: 0 2px 8px rgba(0,0,0,.10);
+}
+.studio-actions[hidden] { display: none; }
+.studio-actions button { padding: 5px 8px; display: flex; align-items: center; }
+.studio-actions button svg { width: 15px; height: 15px; }
+.studio-scale {
+  position: absolute; bottom: 12px; right: 12px; z-index: 15;
+  background: rgba(255,255,255,.92); border: 1px solid var(--border); border-radius: 6px;
+  padding: 6px 10px; pointer-events: none;
+}
+.studio-scale .segs { display: flex; height: 6px; border: 1px solid var(--text); }
+.studio-scale .segs span { height: 100%; }
+.studio-scale .segs span:nth-child(odd) { background: var(--text); }
+.studio-scale .segs span:nth-child(even) { background: #fff; }
+.studio-scale .label { margin-top: 3px; color: var(--text2); font-size: 10px; text-align: center; }
+
+.studio-hint {
+  position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%);
+  background: rgba(255,255,255,.92); border: 1px solid var(--border); border-radius: 8px;
+  padding: 4px 12px; color: var(--text2); pointer-events: none; white-space: nowrap; font-size: 11px;
+}
+.studio-head .field { display: flex; align-items: center; gap: 4px; }
+.studio-head .field input, .studio-head .field select {
+  font: inherit; border: 1px solid var(--border); border-radius: 5px; padding: 3px 6px; min-width: 0; flex: 1;
+}
+.studio-parts { padding: 4px 12px; display: flex; flex-direction: column; gap: 4px; }
+.studio-side .btn-row { display: flex; gap: 4px; }
+.studio-side .btn-row button { border: 1px solid var(--border); flex: 1; }
+
+/* ---- status bar ---- */
+#statusbar {
+  flex: none; height: 26px; display: flex; align-items: center; gap: 10px; padding: 0 12px;
+  border-top: 1px solid var(--border); color: var(--text2); background: var(--bg);
+}
+#statusbar .spacer { flex: 1; }
+#statusbar select { font: inherit; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--text); }
+#statusbar label { display: flex; align-items: center; gap: 4px; }
+#st-coords { font-variant-numeric: tabular-nums; min-width: 150px; }
