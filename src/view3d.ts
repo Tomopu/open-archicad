@@ -4,10 +4,17 @@
 import * as THREE from 'three'
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
 import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js'
-import { Store, Wall, Opening, Entity, isWindow, MATERIALS, TexKind, FURN_DEFAULTS } from './model'
-import { Pt, pt, sub, norm, dist, distToSeg, snapTo, angleDetentDeg } from './geometry'
+import { Store, Wall, Opening, Entity, SketchE, isWindow, MATERIALS, TexKind, FURN_DEFAULTS } from './model'
+import {
+  Pt, pt, sub, norm, dist, distToSeg, snapTo, angleDetentDeg,
+  sketchFaces, faceNesting, faceInfo, faceKey, polyCentroid
+} from './geometry'
 
 const M = 1 / 1000 // mm → m
+
+export type ViewPreset =
+  | 'top' | 'bottom' | 'front' | 'back' | 'right' | 'left' | 'side'
+  | 'iso' | 'iso-sw' | 'iso-se' | 'iso-nw' | 'iso-ne'
 /** 床スラブ厚(m)。スラブは各階の 0〜+FLOOR_T に置き、壁・柱はスラブを貫通して階の底まで届く */
 const FLOOR_T = 0.1
 
@@ -19,6 +26,17 @@ function moveEntity(ent: Entity, dxmm: number, dzmm: number): void {
     if (ent.type === 'dimension') { ent.anchorA = undefined; ent.anchorB = undefined }
   }
   else if (ent.type === 'room') ent.poly = ent.poly.map(mv)
+  else if (ent.type === 'sketch') {
+    ent.edges = ent.edges.map(ed => ({ ...ed, a: mv(ed.a), b: mv(ed.b) }))
+    if (ent.faces) {
+      const nf: typeof ent.faces = {}
+      for (const [k, v] of Object.entries(ent.faces)) {
+        const [x, y] = k.split(':').map(Number)
+        nf[`${Math.round(x + dxmm)}:${Math.round(y + dzmm)}`] = v
+      }
+      ent.faces = nf
+    }
+  }
   else if ('pos' in ent) {
     ;(ent as { pos: Pt }).pos = mv((ent as { pos: Pt }).pos)
     if ('attach' in ent) (ent as { attach?: unknown }).attach = undefined // 移動したら取り付け解除
@@ -150,6 +168,15 @@ function mkOutlined(parent: THREE.Group, kind: string, x: number, y: number, z: 
   parent.add(g)
 }
 
+const lineMatCache = new Map<string, THREE.LineBasicMaterial>()
+/** スケッチの辺の色付きラインマテリアル(キャッシュ) */
+function sketchLineMat(c?: string): THREE.LineBasicMaterial {
+  const key = c ?? '#1f2937'
+  let m = lineMatCache.get(key)
+  if (!m) { m = new THREE.LineBasicMaterial({ color: key }); lineMatCache.set(key, m) }
+  return m
+}
+
 const colorCache = new Map<string, THREE.Material>()
 /** 単色指定のマテリアル(キャッシュ)。仕上げより優先 */
 function colorMat(c?: string): THREE.Material | null {
@@ -240,9 +267,20 @@ export class View3D {
   private levelYs: number[] = [0]
   private rebuildPending = false
   private ground!: THREE.Mesh
-  private grid!: THREE.GridHelper
+  private grid = new THREE.Group()
+  private gridStepBuilt = 0
+  /** 2D 側のグリッド幅 mm(グリッドの位置を平面図と一致させる) */
+  getGrid: () => number = () => 910
+  /** 階境界の点線・ワイヤーフレーム・断面(輪切り) */
+  private floorLines = new THREE.Group()
+  private wireframeOn = false
+  private sectionPlane = new THREE.Plane(new THREE.Vector3(0, -1, 0), 0)
+  private sectionOn = false
+  private sectionFrac = 0.5
   /** 上階を隠す(内観の確認用) */
   showUpper = true
+  /** 下階を隠す */
+  showLower = true
   /** 計測モード */
   measureOn = false
   private measureA: THREE.Vector3 | null = null
@@ -300,8 +338,8 @@ export class View3D {
     this.ground = new THREE.Mesh(new THREE.CircleGeometry(60, 48).rotateX(-Math.PI / 2), MAT.ground)
     this.ground.position.y = -0.06
     this.scene.add(this.ground)
-    this.grid = new THREE.GridHelper(60, 60, 0xe4e4e7, 0xf0f0f1)
-    this.scene.add(this.grid)
+    this.buildGrid(910)
+    this.scene.add(this.grid, this.floorLines)
     this.scene.add(this.gizmo, this.measureGroup, this.preview)
     // XYZ 軸: 太い円柱で表現し、実質無限長(±250m)に見せる
     {
@@ -365,6 +403,73 @@ export class View3D {
     this.resize()
   }
 
+  /**
+   * 平面図と同じ位置のグリッド(原点基準・gridStep の倍数)。
+   * 主線 = 実線 / 1 グリッドを 4 等分する補助線 = 点線
+   */
+  private buildGrid(stepMm: number): void {
+    this.grid.traverse(o => {
+      if (o instanceof THREE.LineSegments) { o.geometry.dispose(); (o.material as THREE.Material).dispose() }
+    })
+    this.grid.clear()
+    this.gridStepBuilt = stepMm
+    const step = stepMm * M
+    const half = 30 // ±30m
+    const n = Math.floor(half / step)
+    const main: number[] = []
+    const quart: number[] = []
+    for (let i = -n; i <= n; i++) {
+      const c = i * step
+      main.push(-half, 0, c, half, 0, c, c, 0, -half, c, 0, half)
+      for (let q = 1; q < 4; q++) {
+        const cq = c + (q * step) / 4
+        if (cq > half) continue
+        quart.push(-half, 0, cq, half, 0, cq, cq, 0, -half, cq, 0, half)
+      }
+    }
+    const mk = (arr: number[], mat: THREE.Material): THREE.LineSegments => {
+      const g = new THREE.BufferGeometry()
+      g.setAttribute('position', new THREE.Float32BufferAttribute(arr, 3))
+      return new THREE.LineSegments(g, mat)
+    }
+    const quartL = mk(quart, new THREE.LineDashedMaterial({ color: 0xededf0, dashSize: 0.10, gapSize: 0.09 }))
+    quartL.computeLineDistances()
+    this.grid.add(quartL, mk(main, new THREE.LineBasicMaterial({ color: 0xdfdfe3 })))
+  }
+
+  /** ワイヤーフレーム表示の切替 */
+  setWireframe(v: boolean): void {
+    this.wireframeOn = v
+    this.applyWireframe()
+    this.render()
+  }
+  private applyWireframe(): void {
+    const seen = new Set<THREE.Material>()
+    this.model.traverse(o => {
+      if (!(o instanceof THREE.Mesh)) return
+      for (const m of Array.isArray(o.material) ? o.material : [o.material]) {
+        if (seen.has(m)) continue
+        seen.add(m)
+        if ('wireframe' in m) (m as THREE.MeshLambertMaterial).wireframe = this.wireframeOn
+      }
+    })
+  }
+
+  /** 断面(輪切り)表示: frac = 建物高さに対する切断位置 0..1 */
+  setSection(on: boolean, frac?: number): void {
+    this.sectionOn = on
+    if (frac !== undefined) this.sectionFrac = frac
+    if (!on) {
+      this.renderer.clippingPlanes = []
+    } else {
+      const bb = new THREE.Box3().setFromObject(this.model)
+      const top = bb.isEmpty() ? 3 : bb.max.y
+      this.sectionPlane.constant = Math.max(0.05, top * this.sectionFrac)
+      this.renderer.clippingPlanes = [this.sectionPlane]
+    }
+    this.render()
+  }
+
   // ---------------- 3D 直接編集 ----------------
   private ray(e: PointerEvent): THREE.Raycaster {
     const r = this.renderer.domElement.getBoundingClientRect()
@@ -375,12 +480,14 @@ export class View3D {
     this.raycaster.setFromCamera(ndc, this.camera)
     return this.raycaster
   }
-  private pick(e: PointerEvent): { id: string; level: number; point: THREE.Vector3; topFace: boolean } | null {
+  /** activeOnly: 編集中の階のオブジェクトだけを対象にする(選択時) */
+  private pick(e: PointerEvent, activeOnly = false): { id: string; level: number; point: THREE.Vector3; topFace: boolean } | null {
     const hits = this.ray(e).intersectObjects(this.model.children, true)
     for (const h of hits) {
       let o: THREE.Object3D | null = h.object
       while (o && !o.userData.entId) o = o.parent
       if (o) {
+        if (activeOnly && o.userData.level !== (this.store?.active ?? 0)) continue
         const n = h.face ? h.face.normal.clone().transformDirection(h.object.matrixWorld) : null
         return {
           id: o.userData.entId as string,
@@ -480,6 +587,18 @@ export class View3D {
       mkH(new THREE.ConeGeometry(0.09, 0.2, 12), 0x2563eb, 'h', mid.x * M, yBase + e.height * M + 0.15, mid.y * M)
       return
     }
+    if (e.type === 'sketch') {
+      // 各面の中心に高さ(押し出し)の円錐つまみ。ドラッグで立体化・高さ変更
+      const faces = sketchFaces(e)
+      faces.forEach((f, i) => {
+        const info = faceInfo(e, f)
+        if (info.dead) return
+        const c = polyCentroid(f)
+        mkOutlined(this.gizmo, `sf${i}`, c.x * M, yBase + (info.h ?? 0) * M + 0.14, c.y * M,
+          new THREE.ConeGeometry(0.10, 0.21, 12), new THREE.ConeGeometry(0.072, 0.16, 12), 0x2563eb)
+      })
+      return
+    }
     if (e.type !== 'furniture' && e.type !== 'column' && e.type !== 'custom') return
     const elev = (e.type !== 'column' ? (e.elev ?? 0) : 0) * M
     const cx = e.pos.x * M, cz = e.pos.y * M
@@ -546,27 +665,41 @@ export class View3D {
   }
 
   // ---------------- 視点プリセット・表示切替・書き出し(3D CAD 補助機能) ----------------
-  setView(preset: 'top' | 'front' | 'side' | 'iso'): void {
+  setView(preset: ViewPreset): void {
     const bb = new THREE.Box3().setFromObject(this.model)
     const c = bb.isEmpty() ? new THREE.Vector3(0, 1, 0) : bb.getCenter(new THREE.Vector3())
     const size = bb.isEmpty() ? 10 : bb.getSize(new THREE.Vector3()).length()
     const d = Math.max(6, size * 1.1)
-    const pos = {
+    const i7 = d * 0.7, i6 = d * 0.6, e15 = d * 0.15
+    // 平面図の上 = 北(-z)。南 = +z / 東 = +x / 西 = -x
+    const pos: Record<ViewPreset, number[]> = {
       top: [c.x, c.y + d, c.z + 0.01],
-      front: [c.x, c.y + d * 0.15, c.z + d],
-      side: [c.x + d, c.y + d * 0.15, c.z],
-      iso: [c.x + d * 0.7, c.y + d * 0.6, c.z + d * 0.7]
-    }[preset]
-    this.camera.position.set(pos[0], pos[1], pos[2])
+      bottom: [c.x, c.y - d, c.z + 0.01],
+      front: [c.x, c.y + e15, c.z + d],
+      back: [c.x, c.y + e15, c.z - d],
+      right: [c.x + d, c.y + e15, c.z],
+      left: [c.x - d, c.y + e15, c.z],
+      side: [c.x + d, c.y + e15, c.z],
+      iso: [c.x + i7, c.y + i6, c.z + i7],
+      'iso-sw': [c.x - i7, c.y + i6, c.z + i7],
+      'iso-se': [c.x + i7, c.y + i6, c.z + i7],
+      'iso-nw': [c.x - i7, c.y + i6, c.z - i7],
+      'iso-ne': [c.x + i7, c.y + i6, c.z - i7]
+    }
+    const p = pos[preset]
+    this.camera.position.set(p[0], p[1], p[2])
     this.controls.target.copy(c)
     this.controls.update()
     this.render()
   }
 
-  /** 上階の表示/非表示(内観確認用)。再構築なしで階グループの visible を切り替え */
+  /** 上階・下階の表示/非表示。再構築なしで階グループの visible を切り替え */
   applyFloorVisibility(): void {
     if (!this.store) return
-    this.model.children.forEach((g, i) => { g.visible = this.showUpper || i <= this.store!.active })
+    const a = this.store.active
+    this.model.children.forEach((g, i) => {
+      g.visible = i === a || (i < a ? this.showLower : this.showUpper)
+    })
     this.render()
   }
 
@@ -623,13 +756,13 @@ export class View3D {
         }
         return
       }
-      if (kind && ent && (ent.type === 'furniture' || ent.type === 'column' || ent.type === 'wall' || ent.type === 'custom')) {
+      if (kind && ent && (ent.type === 'furniture' || ent.type === 'column' || ent.type === 'wall' || ent.type === 'custom' || ent.type === 'sketch')) {
         e.stopPropagation()
         try { this.renderer.domElement.setPointerCapture(e.pointerId) } catch { /* noop */ }
         this.controls.enabled = false
         this.renderer.domElement.style.cursor = 'grabbing'
         this.store.commit()
-        const hasWD = ent.type !== 'wall'
+        const hasWD = ent.type === 'furniture' || ent.type === 'column' || ent.type === 'custom'
         const startDist = hasWD
           ? Math.hypot(gHits[0].point.x - ent.pos.x * M, gHits[0].point.z - ent.pos.y * M)
           : 1
@@ -647,7 +780,8 @@ export class View3D {
       }
     }
     if (this.getTool() !== 'select') return // 配置ツール中はクリック(up)で配置。ドラッグはカメラ操作のまま
-    const hit = this.pick(e)
+    // 選択は編集中の階のオブジェクトのみ(1F 編集中は 1F だけ選べる)
+    const hit = this.pick(e, true)
     if (!hit) {
       // Shift+空ドラッグ → 範囲選択(緑の点線)
       if (e.shiftKey) {
@@ -787,6 +921,27 @@ export class View3D {
     if (this.gizmoDrag && this.store) {
       const ent = this.store.byId(this.gizmoDrag.id)
       if (!ent) return
+      if (ent.type === 'sketch' && this.gizmoDrag.kind.startsWith('sf')) {
+        // 面の円錐つまみ: 上下ドラッグで押し出し高さ(0 = 平面に戻る)
+        const idx = parseInt(this.gizmoDrag.kind.slice(2), 10)
+        const f = sketchFaces(ent)[idx]
+        if (!f) return
+        const c = polyCentroid(f)
+        const dir = this.camera.getWorldDirection(new THREE.Vector3())
+        const n = new THREE.Vector3(dir.x, 0, dir.z).normalize()
+        const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(
+          n, new THREE.Vector3(c.x * M, this.gizmoDrag.grabY, c.y * M))
+        const p = new THREE.Vector3()
+        if (!this.ray(e).ray.intersectPlane(plane, p)) return
+        const yBase = this.levelYs[this.store.active] ?? 0
+        const h = Math.max(0, snapTo((p.y - yBase) * 1000, 50))
+        ent.faces ??= {}
+        const info = faceInfo(ent, f)
+        ent.faces[faceKey(f)] = { ...info, h: h > 0 ? h : undefined, dead: false }
+        this.showHint(`高さ ${h}`, e.clientX, e.clientY)
+        this.rebuildSoon()
+        return
+      }
       if (ent.type === 'wall') {
         const k = this.gizmoDrag.kind
         if (k === 'wa' || k === 'wb') {
@@ -1054,7 +1209,7 @@ export class View3D {
       if (p) this.onPlace(p, undefined, this.store.active)
       return
     }
-    if (!this.pick(e)) {
+    if (!this.pick(e, true)) {
       this.onSelect('', this.store.active, 'replace') // 空クリックで選択解除
       this.highlightSelection()
     }
@@ -1112,7 +1267,7 @@ export class View3D {
   /** 配置ツールのゴーストプレビューをカーソル位置に表示 */
   private updatePreview(e: PointerEvent): void {
     const tool = this.getTool()
-    const place = ['wall', 'column', 'stair', 'furniture', 'equipment', 'planting', 'label', 'component', 'door', 'window', 'room', 'dimension']
+    const place = ['wall', 'column', 'stair', 'furniture', 'equipment', 'planting', 'label', 'component', 'door', 'window', 'room', 'dimension', 'pencil']
     if (tool === 'select' || this.measureOn || !place.includes(tool) || !this.store) { this.hidePreview(); return }
     const yBase = this.levelYs[this.store.active] ?? 0
     this.previewBox.visible = false
@@ -1156,9 +1311,9 @@ export class View3D {
           }
         }
       }
-    } else if (tool === 'room' || tool === 'dimension') {
+    } else if (tool === 'room' || tool === 'dimension' || tool === 'pencil') {
       const gp = this.groundPoint(e)
-      const pts = tool === 'room' ? this.getRoomPts() : this.getDimPts()
+      const pts = tool === 'dimension' ? this.getDimPts() : this.getRoomPts()
       if (gp) {
         const v: THREE.Vector3[] = pts.map(q => new THREE.Vector3(q.x * M, yBase + 0.03, q.y * M))
         v.push(new THREE.Vector3(snapTo(gp.x, this.getSnap()) * M, yBase + 0.03, snapTo(gp.y, this.getSnap()) * M))
@@ -1207,6 +1362,8 @@ export class View3D {
   /** 平面図から 3D モデルを再構築(全階を積層して一棟まるごと生成) */
   rebuild(store: Store): void {
     this.store = store
+    // グリッドを 2D と同じ幅に(変わったときだけ作り直す)
+    if (this.getGrid() !== this.gridStepBuilt) this.buildGrid(this.getGrid())
     // 軽量化: 古いジオメトリを GPU から確実に解放(解放しないと徐々に重くなる)
     this.model.traverse(o => { if (o instanceof THREE.Mesh) o.geometry.dispose() })
     this.model.clear()
@@ -1221,14 +1378,50 @@ export class View3D {
       this.target = g
       this.levelIdx = li
       this.buildLevel(level.entities)
-      // 次の階の床レベル = この階の最大壁高 + 床スラブ厚
-      const maxWallH = Math.max(2400, ...level.entities.filter((e): e is Wall => e.type === 'wall').map(w => w.height))
-      yBase += maxWallH * M + 0.1
+      // 次の階の床レベル = 階高(設定があれば)/ なければ最大壁高 + 床スラブ厚
+      if (level.height && level.height > 0) {
+        yBase += level.height * M
+      } else {
+        const maxWallH = Math.max(2400, ...level.entities.filter((e): e is Wall => e.type === 'wall').map(w => w.height))
+        yBase += maxWallH * M + 0.1
+      }
     }
     this.target = this.model
 
-    // 上階を隠す設定を反映
-    this.model.children.forEach((g, i) => { g.visible = this.showUpper || i <= store.active })
+    // 階の境界に薄い点線を表示(1F と 2F の境目など)
+    this.floorLines.traverse(o => {
+      if (o instanceof THREE.Line) { o.geometry.dispose(); (o.material as THREE.Material).dispose() }
+    })
+    this.floorLines.clear()
+    {
+      const bb = new THREE.Box3().setFromObject(this.model)
+      if (!bb.isEmpty()) {
+        for (let i = 1; i < this.levelYs.length; i++) {
+          const y = this.levelYs[i] - FLOOR_T
+          const m = 0.05
+          const ptsL = [
+            new THREE.Vector3(bb.min.x - m, y, bb.min.z - m),
+            new THREE.Vector3(bb.max.x + m, y, bb.min.z - m),
+            new THREE.Vector3(bb.max.x + m, y, bb.max.z + m),
+            new THREE.Vector3(bb.min.x - m, y, bb.max.z + m),
+            new THREE.Vector3(bb.min.x - m, y, bb.min.z - m)
+          ]
+          const ln = new THREE.Line(
+            new THREE.BufferGeometry().setFromPoints(ptsL),
+            new THREE.LineDashedMaterial({ color: 0x9ca3af, dashSize: 0.16, gapSize: 0.12, transparent: true, opacity: 0.7 }))
+          ln.computeLineDistances()
+          this.floorLines.add(ln)
+        }
+      }
+    }
+
+    // ワイヤーフレーム・上下階の表示設定を反映
+    if (this.wireframeOn) this.applyWireframe()
+    if (this.sectionOn) this.setSection(true)
+    const active = store.active
+    this.model.children.forEach((g, i) => {
+      g.visible = i === active || (i < active ? this.showLower : this.showUpper)
+    })
 
     // カメラの注視点合わせは初回だけ(再構築のたびに視点が飛ばないように)
     if (!this.didFitCamera) {
@@ -1274,12 +1467,14 @@ export class View3D {
 
     let floorIdx = 0
     for (const e of ents) {
+      if (e.hidden) continue
       const before = this.target.children.length
       if (e.type === 'wall') this.buildWall(e, openingsByWall.get(e.id) ?? [], joinExt(e.a, e), joinExt(e.b, e), wallIdx++)
       else if (e.type === 'room') {
         if (e.use !== '吹き抜け') this.buildFloor(e.poly, colorMat(e.color) ?? finishMat(e.material), floorIdx++)
       }
       else if (e.type === 'stair') this.buildStair(e, colorMat(e.color) ?? finishMat(e.material))
+      else if (e.type === 'sketch') this.buildSketch(e)
       else if (e.type === 'furniture' || e.type === 'equipment' || e.type === 'column' || e.type === 'planting' || e.type === 'custom') {
         this.buildOne(e)
       }
@@ -1551,6 +1746,48 @@ export class View3D {
       cur = to
     }
     place(cur, L + (extB > 0 ? extB - 0.002 : 0), 0, H, mat)
+  }
+
+  /**
+   * スケッチ(鉛筆): 閉路 = 面。押し出し高さのある面は立体に、
+   * 内側の面(入れ子)は外側から貫通して抜き、それ自身の高さで立ち上げる。
+   * 削除(dead)された面は穴のまま。辺は色付きラインで表示。
+   */
+  private buildSketch(e: SketchE): void {
+    const g = new THREE.Group()
+    const faces = sketchFaces(e)
+    const parents = faceNesting(faces)
+    const toV2 = (poly: Pt[]): THREE.Vector2[] => poly.map(p => new THREE.Vector2(p.x * M, p.y * M))
+    for (let i = 0; i < faces.length; i++) {
+      const info = faceInfo(e, faces[i])
+      if (info.dead) continue
+      const shape = new THREE.Shape(toV2(faces[i]))
+      for (let j = 0; j < faces.length; j++) {
+        if (parents[j] === i) shape.holes.push(new THREE.Path(toV2(faces[j]))) // 内側の面は貫通
+      }
+      const hM = (info.h ?? 0) * M
+      let geo: THREE.BufferGeometry
+      if (hM > 0.001) {
+        geo = new THREE.ExtrudeGeometry(shape, { depth: hM, bevelEnabled: false })
+        geo.rotateX(Math.PI / 2)
+        geo.translate(0, hM, 0) // 床面から上へ
+      } else {
+        geo = new THREE.ShapeGeometry(shape)
+        geo.rotateX(Math.PI / 2)
+        geo.translate(0, 0.004, 0) // 床とのZファイト防止
+      }
+      const mesh = new THREE.Mesh(geo, hM > 0.001 ? MAT.wall : MAT.stair)
+      g.add(mesh)
+    }
+    // 辺(色付き)
+    for (const ed of e.edges) {
+      const lg = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(ed.a.x * M, 0.008, ed.a.y * M),
+        new THREE.Vector3(ed.b.x * M, 0.008, ed.b.y * M)
+      ])
+      g.add(new THREE.Line(lg, sketchLineMat(ed.color)))
+    }
+    this.target.add(g)
   }
 
   private buildFloor(poly: { x: number; y: number }[], mat: THREE.Material | null = null, idx = 0): void {

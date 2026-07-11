@@ -31,8 +31,22 @@
         <button id="copy-below" title="下階の壁・柱をこの階に複製">下階の壁をコピー</button>
       </div>
       <div class="tabs">
-        <button id="tab-2d" class="tab active">平面図</button>
-        <button id="tab-3d" class="tab">3D</button>
+        <select id="view-select" title="視点の切替">
+          <optgroup label="2D ビュー">
+            <option value="plan" selected>平面図</option>
+            <option value="bottom">下面図</option>
+            <option value="right">右側面図</option>
+            <option value="left">左側面図</option>
+            <option value="front">正面図</option>
+            <option value="back">背面図</option>
+          </optgroup>
+          <optgroup label="3D ビュー">
+            <option value="iso-sw">南西アイソメ</option>
+            <option value="iso-se">南東アイソメ</option>
+            <option value="iso-nw">北西アイソメ</option>
+            <option value="iso-ne">北東アイソメ</option>
+          </optgroup>
+        </select>
       </div>
     </header>
 
@@ -53,8 +67,11 @@
             <button data-view="side" title="側面">横</button>
             <button data-view="iso" title="鳥瞰">鳥</button>
             <span class="sep"></span>
-            <label class="hint" style="display:flex;align-items:center;gap:3px">
+            <label class="hint" style="display:flex;align-items:center;gap:3px" title="上の階を表示 / 非表示">
               <input type="checkbox" id="chk3d-upper" checked> 上階
+            </label>
+            <label class="hint" style="display:flex;align-items:center;gap:3px" title="下の階を表示 / 非表示">
+              <input type="checkbox" id="chk3d-lower" checked> 下階
             </label>
             <label class="hint" style="display:flex;align-items:center;gap:3px" title="X(赤)・Y(緑)・Z(青)軸を表示">
               <input type="checkbox" id="chk3d-axes"> 軸
@@ -62,6 +79,14 @@
             <label class="hint" style="display:flex;align-items:center;gap:3px" title="地面とグリッドの表示">
               <input type="checkbox" id="chk3d-ground" checked> 地面
             </label>
+            <span class="sep"></span>
+            <label class="hint" style="display:flex;align-items:center;gap:3px" title="ワイヤーフレーム表示">
+              <input type="checkbox" id="chk3d-wire"> 線画
+            </label>
+            <label class="hint" style="display:flex;align-items:center;gap:3px" title="輪切り(断面)表示。スライダーで切断高さを調整">
+              <input type="checkbox" id="chk3d-section"> 輪切り
+            </label>
+            <input type="range" id="rng3d-section" min="2" max="100" value="50" style="width:70px" hidden title="切断高さ">
             <button id="btn-rebuild3d" title="3Dモデルを再生成">再生成</button>
           </div>
         </div>
@@ -74,6 +99,7 @@
           <button data-act="rotate" title="90°回転 (R)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 11a8.5 8.5 0 1 0-2.2 7"/><path d="M21 4.5V11h-6.5"/></svg></button>
           <button data-act="dup" title="複製"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
           <button data-act="group" title="グループ化 / 解除"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="8" height="8" rx="1.5"/><rect x="13" y="13" width="8" height="8" rx="1.5"/><path d="M11 7h4a2 2 0 0 1 2 2v4M13 17H9a2 2 0 0 1-2-2v-4" stroke-dasharray="2.5 2"/></svg></button>
+          <button data-act="erase" title="この面を削除(貫通穴にする)" hidden><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20H8.5l-5-5a1.4 1.4 0 0 1 0-2L12 4.5a1.4 1.4 0 0 1 2 0L20.5 11a1.4 1.4 0 0 1 0 2L14 19.5"/><path d="M8 9.5 15 16.5"/></svg></button>
           <button data-act="del" title="削除 (Del)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M10 7V5a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v2M6.5 7l.8 12a1 1 0 0 0 1 .9h7.4a1 1 0 0 0 1-.9l.8-12M10 11v5M14 11v5"/></svg></button>
         </div>
         <div id="dim-chips" hidden></div>
@@ -99,6 +125,12 @@
         <aside id="right-panel" class="panel">
           <div class="panel-title">プロパティ</div>
           <div id="properties" class="props"><div class="empty">要素を選択してください</div></div>
+          <div class="panel-title">オブジェクト一覧
+            <span class="title-actions">
+              <button id="objlist-group" title="チェックした要素をグループ化 / 解除" hidden>グループ化</button>
+            </span>
+          </div>
+          <div id="object-list" class="comp-list"></div>
           <div class="panel-title">プロジェクト設定</div>
           <div id="project-settings" class="props"></div>
           <div class="panel-title">リーガルチェック
@@ -129,6 +161,7 @@
       <label><input type="checkbox" id="st-grid" checked> グリッド</label>
       <label>グリッド幅 <input type="number" id="st-gridstep" value="910" min="10" step="5" style="width:60px"> mm</label>
       <label title="壁厚の自動表記 (t=120)"><input type="checkbox" id="st-wallt" checked> 壁厚</label>
+      <button id="st-guides" title="スナップガイド(端点・中点・延長など)の有効 / 無効">ガイド ▾</button>
       <span class="spacer"></span>
       <span id="st-zoom">100%</span>
       <span id="st-msg"></span>

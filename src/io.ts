@@ -244,8 +244,9 @@ export function saveComponents(list: ComponentDef[]): void {
   localStorage.setItem(LS_KEY, JSON.stringify(list))
 }
 
-/** 選択要素をコンポーネント化(基準点=境界中心、壁と建具の関係は保持) */
-export function makeComponent(name: string, store: Store, ids: Set<string>): ComponentDef {
+/** 選択要素をコンポーネント化(基準点=境界中心。base 指定で基準点複写の基準にできる)。
+ *  壁と建具の関係は保持 */
+export function makeComponent(name: string, store: Store, ids: Set<string>, base?: Pt): ComponentDef {
   const sel = store.doc.entities.filter(e => ids.has(e.id))
   // 選択中の壁に載る建具も含める
   const wallIds = new Set(sel.filter(e => e.type === 'wall').map(e => e.id))
@@ -259,16 +260,27 @@ export function makeComponent(name: string, store: Store, ids: Set<string>): Com
   for (const c of clones) {
     if (c.type === 'wall' || c.type === 'dimension') { collect(c.a); collect(c.b) }
     else if (c.type === 'room') c.poly.forEach(collect)
+    else if (c.type === 'sketch') c.edges.forEach(ed => { collect(ed.a); collect(ed.b) })
     else if ('pos' in c) collect((c as { pos: Pt }).pos)
   }
   if (!xs.length) throw new Error('コンポーネント化できる要素がありません')
-  const cx = (Math.min(...xs) + Math.max(...xs)) / 2
-  const cy = (Math.min(...ys) + Math.max(...ys)) / 2
+  const cx = base ? base.x : (Math.min(...xs) + Math.max(...xs)) / 2
+  const cy = base ? base.y : (Math.min(...ys) + Math.max(...ys)) / 2
   const shift = (p: Pt): Pt => pt(p.x - cx, p.y - cy)
   for (const c of clones) {
     if (c.type === 'wall' || c.type === 'dimension') { c.a = shift(c.a); c.b = shift(c.b) }
     else if (c.type === 'room') c.poly = c.poly.map(shift)
-    else if ('pos' in c) (c as { pos: Pt }).pos = shift((c as { pos: Pt }).pos)
+    else if (c.type === 'sketch') {
+      c.edges = c.edges.map(ed => ({ ...ed, a: shift(ed.a), b: shift(ed.b) }))
+      if (c.faces) {
+        const nf: typeof c.faces = {}
+        for (const [k, v] of Object.entries(c.faces)) {
+          const [x, y] = k.split(':').map(Number)
+          nf[`${Math.round(x - cx)}:${Math.round(y - cy)}`] = v
+        }
+        c.faces = nf
+      }
+    } else if ('pos' in c) (c as { pos: Pt }).pos = shift((c as { pos: Pt }).pos)
   }
   return { name, entities: clones }
 }

@@ -23,6 +23,10 @@ export class Renderer2D {
   showGrid = true
   /** グリッド幅 mm(主グリッド。半分の位置に補助線も描く) */
   gridStep = 910
+  /** 壁の基準線(通り芯)を表示 */
+  showRefLine = true
+  /** スケッチのサブ選択(面・閉路・辺)。ツール側から設定 */
+  sketchSub: { id: string; mode: 'face' | 'loop' | 'edge'; faceIdx?: number; edgeIdx?: number } | null = null
   /** 下階を透かして表示(2階以上で編集するときの位置合わせ用) */
   showGhost = true
   /** 壁厚の自動表記(t=120)を表示 */
@@ -58,7 +62,7 @@ export class Renderer2D {
     ctx.save()
     ctx.setTransform(dpr * vp.zoom, 0, 0, dpr * vp.zoom, -vp.view.x * vp.zoom * dpr, -vp.view.y * vp.zoom * dpr)
 
-    const ents = this.store.doc.entities
+    const ents = this.store.doc.entities.filter(e => !e.hidden)
     const walls = new Map<string, Wall>()
     for (const e of ents) if (e.type === 'wall') walls.set(e.id, e)
 
@@ -95,6 +99,9 @@ export class Renderer2D {
       else if (e.type === 'planting') sym.drawPlanting(ctx, e, vp.zoom)
       else if (e.type === 'dimension') sym.drawDimension(ctx, e, vp.zoom)
       else if (e.type === 'label') sym.drawLabel(ctx, e)
+      else if (e.type === 'sketch') {
+        sym.drawSketch(ctx, e, vp.zoom, this.sketchSub?.id === e.id ? this.sketchSub : null)
+      }
     }
 
     // リーガルチェックのハイライト(注意=黄 / 不適合=赤 の半透明塗り)
@@ -182,6 +189,25 @@ export class Renderer2D {
       ctx.fillStyle = w.color ?? '#374151'
       this.fillWallQuad(w, joined[i][0], joined[i][1], 0, miters.get(w))
     })
+
+    // 基準線(通り芯): 壁の中心線 + refOff の位置に一点鎖線。両端を少し延長して描く
+    if (this.showRefLine) {
+      ctx.save()
+      ctx.strokeStyle = '#b6bcc6'
+      ctx.lineWidth = 0.7 / vp.zoom
+      ctx.setLineDash([420 , 120, 50, 120])
+      for (const w of walls) {
+        const d = norm(sub(w.b, w.a)), n = perp(d)
+        const off = w.refOff ?? 0
+        const ext = 300
+        ctx.beginPath()
+        ctx.moveTo(w.a.x + n.x * off - d.x * ext, w.a.y + n.y * off - d.y * ext)
+        ctx.lineTo(w.b.x + n.x * off + d.x * ext, w.b.y + n.y * off + d.y * ext)
+        ctx.stroke()
+      }
+      ctx.setLineDash([])
+      ctx.restore()
+    }
 
     // 壁厚の表記(t=120)。ズームが十分なときだけ、壁の脇に沿って小さく描く
     if (this.showWallT && vp.zoom * 300 > 14) {
@@ -349,6 +375,10 @@ export class Renderer2D {
         return { min: { x: e.pos.x - w2, y: e.pos.y - h2 }, max: { x: e.pos.x + w2, y: e.pos.y + h2 } }
       }
       case 'room': return bbox(e.poly)
+      case 'sketch': {
+        if (!e.edges.length) return null
+        return bbox(e.edges.flatMap(ed => [ed.a, ed.b]))
+      }
     }
   }
 

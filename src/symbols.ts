@@ -1,9 +1,12 @@
 // JIS A 0150(建築製図通則)の平面表示記号に準拠した 2D 記号描画
 // ctx はワールド座標(mm)に変換済み。線幅は zoom で割って画面ピクセル一定にする。
 import {
-  Wall, Opening, Stair, Furniture, Equipment, Planting, DimensionE, LabelE, Room, isWindow, MATERIALS
+  Wall, Opening, Stair, Furniture, Equipment, Planting, DimensionE, LabelE, Room, SketchE, isWindow, MATERIALS
 } from './model'
-import { Pt, sub, norm, perp, lerp, dist, netPolyArea, labelAnchor } from './geometry'
+import {
+  Pt, sub, norm, perp, lerp, dist, netPolyArea, labelAnchor,
+  sketchFaces, faceNesting, faceInfo, polyCentroid
+} from './geometry'
 
 const INK = '#1f2937'
 const THIN = '#6b7280'
@@ -435,4 +438,69 @@ export function drawRoom(ctx: CanvasRenderingContext2D, r: Room, zoom: number, h
 
 export function drawLabel(ctx: CanvasRenderingContext2D, l: LabelE): void {
   text(ctx, l.text, l.pos.x, l.pos.y, l.size)
+}
+
+// ---------------- スケッチ(鉛筆ツール) ----------------
+/**
+ * 閉路 = 面として薄く塗る(削除された面は塗らない)。押し出し高さがある面は
+ * 少し濃く塗って h=**** を添記。辺は個別の色に対応。
+ * sub: 選択中の面/閉路/辺のハイライト指定
+ */
+export function drawSketch(
+  ctx: CanvasRenderingContext2D, s: SketchE, zoom: number,
+  sub?: { mode: 'face' | 'loop' | 'edge'; faceIdx?: number; edgeIdx?: number } | null
+): void {
+  const faces = sketchFaces(s)
+  const parents = faceNesting(faces)
+  // 面の塗り(親 → 子の順で上塗り)
+  const order = faces.map((_, i) => i).sort((a, b) => (parents[a] === -1 ? 0 : 1) - (parents[b] === -1 ? 0 : 1))
+  for (const i of order) {
+    const info = faceInfo(s, faces[i])
+    if (info.dead) {
+      // 削除された面(貫通穴)は白抜き + 細い×印
+      ctx.fillStyle = '#ffffff'
+      fillPoly(ctx, faces[i])
+      continue
+    }
+    const h = info.h ?? 0
+    ctx.fillStyle = h > 0 ? 'rgba(37, 99, 235, 0.10)' : 'rgba(37, 99, 235, 0.045)'
+    fillPoly(ctx, faces[i])
+    if (h > 0) {
+      const c = polyCentroid(faces[i])
+      text(ctx, `h=${h}`, c.x, c.y, 170, 0, THIN)
+    }
+  }
+  // 選択中の面ハイライト
+  if (sub && sub.mode === 'face' && sub.faceIdx !== undefined && faces[sub.faceIdx]) {
+    ctx.fillStyle = 'rgba(37, 99, 235, 0.22)'
+    fillPoly(ctx, faces[sub.faceIdx])
+  }
+  // 辺
+  for (let i = 0; i < s.edges.length; i++) {
+    const e = s.edges[i]
+    ctx.strokeStyle = e.color ?? INK
+    lw(ctx, zoom, 1.2)
+    line(ctx, e.a.x, e.a.y, e.b.x, e.b.y)
+  }
+  // 選択ハイライト(閉路 = 面の境界の辺 / 単一の辺)
+  if (sub && (sub.mode === 'loop' || sub.mode === 'edge')) {
+    ctx.save()
+    ctx.strokeStyle = '#2563eb'
+    lw(ctx, zoom, 2.6)
+    if (sub.mode === 'edge' && sub.edgeIdx !== undefined && s.edges[sub.edgeIdx]) {
+      const e = s.edges[sub.edgeIdx]
+      line(ctx, e.a.x, e.a.y, e.b.x, e.b.y)
+    } else if (sub.mode === 'loop' && sub.faceIdx !== undefined && faces[sub.faceIdx]) {
+      const f = faces[sub.faceIdx]
+      ctx.beginPath()
+      f.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)))
+      ctx.closePath(); ctx.stroke()
+    }
+    ctx.restore()
+  }
+}
+function fillPoly(ctx: CanvasRenderingContext2D, poly: Pt[]): void {
+  ctx.beginPath()
+  poly.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)))
+  ctx.closePath(); ctx.fill()
 }

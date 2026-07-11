@@ -285,3 +285,25 @@ button.active { background: var(--accent-bg); color: var(--accent); border-color
 #statusbar select { font: inherit; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--text); }
 #statusbar label { display: flex; align-items: center; gap: 4px; }
 #st-coords { font-variant-numeric: tabular-nums; min-width: 150px; }
+
+/* ---- 視点プルダウン(2D / 3D) ---- */
+#view-select {
+  font: inherit; font-size: 12px; padding: 4px 8px;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: var(--bg); color: var(--text); cursor: pointer;
+}
+
+/* ---- オブジェクト一覧 ---- */
+#object-list { max-height: 220px; overflow-y: auto; }
+.obj-row { padding: 4px 8px; }
+.obj-eye { flex: none; display: flex; align-items: center; color: var(--text2); padding: 1px 2px; }
+.obj-eye.off { color: #c2c6cd; }
+#objlist-group { font-size: 11px; }
+
+/* ---- スナップガイド設定ポップオーバー ---- */
+.guide-pop { display: flex; flex-direction: column; gap: 2px; padding: 8px 10px; }
+.guide-pop label { display: flex; align-items: center; gap: 6px; padding: 2px 0; cursor: pointer; }
+.guide-pop .cp-title { font-weight: 600; margin-bottom: 4px; }
+#st-guides { border: 1px solid var(--border); border-radius: 4px; padding: 1px 7px; color: var(--text2); }
+#st-guides:hover { background: var(--accent-bg); }
+.studio-rail button.active { color: var(--accent); border-color: var(--accent); background: var(--accent-bg); }

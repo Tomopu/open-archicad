@@ -1,12 +1,12 @@
 // ツール(作図・選択)とポインタ操作
 import {
-  Store, Entity, Wall, Opening, uid, OpeningKind, StairKind, FurnKind, EquipKind, PlantKind,
+  Store, Entity, Wall, Opening, SketchE, uid, OpeningKind, StairKind, FurnKind, EquipKind, PlantKind,
   FURN_DEFAULTS, isWindow, Room, RoomUse, DimAnchor
 } from './model'
 import { Renderer2D } from './renderer2d'
 import {
   Pt, pt, sub, add, dist, distToSeg, projT, lerp, snapTo, pointInPoly, norm, perp, polyArea, rotate,
-  arcThrough, angleDetentDeg, lineIntersect, polyCentroid
+  arcThrough, angleDetentDeg, lineIntersect, polyCentroid, sketchFaces, faceKey, faceInfo
 } from './geometry'
 import {
   drawOpening, drawFurniture, drawStair, drawEquipment, drawPlanting, drawColumn,
@@ -15,11 +15,15 @@ import {
 
 export type ToolName =
   | 'select' | 'wall' | 'column' | 'door' | 'window' | 'stair' | 'furniture'
-  | 'equipment' | 'planting' | 'dimension' | 'label' | 'room' | 'component'
+  | 'equipment' | 'planting' | 'dimension' | 'label' | 'room' | 'pencil' | 'component'
+
+/** 長方形 / 鉛筆(多角形)の入力モード(部屋・鉛筆ツール共通) */
+export type DrawMode = 'rect' | 'poly'
 
 /** 各ツールの現在パラメータ(左パネルの「ツール設定」から編集) */
 export const params = {
-  wall: { thickness: 120, height: 2400, structural: false, arc: false },
+  // offR / offL = 基準線(通り芯)から右側・左側の面までの距離。lock で連動
+  wall: { thickness: 120, height: 2400, structural: false, arc: false, offR: 60, offL: 60, lock: true },
   column: { w: 300, d: 300, h: 2400, shape: 'rect' as 'rect' | 'round' },
   door: { kind: 'door_single' as OpeningKind, width: 780, head: 2000 },
   window: { kind: 'win_sliding' as OpeningKind, width: 1650, sill: 900, head: 2000 },
@@ -27,9 +31,13 @@ export const params = {
   furniture: { kind: 'bed_s' as FurnKind },
   equipment: { kind: 'boiler' as EquipKind },
   planting: { kind: 'tree' as PlantKind, height: 3000 },
-  room: { use: '居室' as RoomUse },
+  room: { use: '居室' as RoomUse, mode: 'rect' as DrawMode },
+  pencil: { mode: 'poly' as DrawMode, color: undefined as string | undefined },
   label: { size: 300 }
 }
+
+/** スナップ種別の有効 / 無効(ステータスバーのガイド設定から変更) */
+export const SNAP_KINDS = ['端点', '中点', '中心', '図心', '交点', '仮想交点', '延長', '線上'] as const
 
 interface ComponentDef { name: string; entities: Entity[] }
 
@@ -51,6 +59,22 @@ export class ToolManager {
   private stairAdjust: string | null = null
   private dimPts: Pt[] = []
   private roomPts: Pt[] = []
+  /** 長方形モード(部屋・鉛筆)の始点 */
+  private rectStart: Pt | null = null
+  /** 鉛筆ツールの現在ストロークの点列(末尾 = 直前の点) */
+  private penPts: Pt[] = []
+  /** 鉛筆ストロークの追記先スケッチ id */
+  private penTarget: string | null = null
+  /** 物理数値キーボードの寸法入力バッファ(Enter で確定) */
+  private numBuf = ''
+  /** カーソル上のモード切替アイコン(鉛筆 / 長方形)のヒット領域(ワールド座標) */
+  private modeIcons: { c: Pt; r: number; mode: DrawMode }[] = []
+  /** 基準点複写: 基準点の選択待ち */
+  private dupAwaitBase = false
+  /** 基準点複写: 選択した基準点(ガイド表示用) */
+  private dupFrom: Pt | null = null
+  /** スナップ種別の有効/無効 */
+  snapEnabled: Record<string, boolean> = Object.fromEntries(SNAP_KINDS.map(k => [k, true]))
   private dragging = false
   private dragStart: Pt = pt(0, 0)
   private dragOrig: Map<string, Entity> = new Map()
@@ -83,6 +107,7 @@ export class ToolManager {
   get wallStartPt(): Pt | null { return this.wallStart }
   get roomPoints(): Pt[] { return this.roomPts }
   get dimPoints(): Pt[] { return this.dimPts }
+  get pencilPoints(): Pt[] { return this.penPts }
   private panning = false
   private panStart: Pt = pt(0, 0)
   private panView: Pt = pt(0, 0)
@@ -172,6 +197,11 @@ export class ToolManager {
         out.push({ p: polyCentroid(e.poly), kind: '図心', ref: { entId: e.id, kind: 'roomC' } })
       } else if (e.type === 'dimension') {
         out.push({ p: e.a, kind: '端点' }, { p: e.b, kind: '端点' })
+      } else if (e.type === 'sketch') {
+        for (const ed of e.edges) {
+          out.push({ p: ed.a, kind: '端点' }, { p: ed.b, kind: '端点' })
+          out.push({ p: lerp(ed.a, ed.b, 0.5), kind: '中点' })
+        }
       } else if ('pos' in e && (e.type === 'furniture' || e.type === 'column' || e.type === 'custom' ||
         e.type === 'equipment' || e.type === 'planting' || e.type === 'stair')) {
         out.push({ p: (e as { pos: Pt }).pos, kind: '中心', ref: { entId: e.id, kind: 'center' } })
@@ -205,7 +235,9 @@ export class ToolManager {
   setTool(t: ToolName): void {
     this.tool = t
     this.wallStart = null; this.dimPts = []; this.roomPts = []
-    if (t !== 'component') this.placingComponent = null
+    this.rectStart = null; this.penPts = []; this.penTarget = null; this.numBuf = ''
+    if (t !== 'component') { this.placingComponent = null; this.dupFrom = null; this.dupAwaitBase = false }
+    this.setSketchSub(null)
     this.onToolChange(t)
     this.updateHint()
     this.r.requestDraw()
@@ -213,7 +245,7 @@ export class ToolManager {
 
   private updateHint(): void {
     const hints: Record<ToolName, string> = {
-      select: 'クリック: 選択 / ドラッグ: 移動 / Delete: 削除 / R: 回転',
+      select: 'クリック: 選択(スケッチは再クリックで 面→閉路→辺 と絞り込み) / ドラッグ: 移動 / Delete: 削除 / R: 回転',
       wall: 'クリックで始点→終点(連続入力) / ツール設定の「円弧壁」で 3点目=通過点の弧 / Shift: 直交 / 右クリック: 終了',
       column: 'クリックで柱を配置 / R: 90°回転',
       door: '壁の上でクリックしてドアを配置 / R・F: 内外反転 / G: 吊元切替',
@@ -224,7 +256,12 @@ export class ToolManager {
       planting: 'クリックで植栽・人物を配置',
       dimension: '2点をクリック→3点目で寸法線の位置を決定',
       label: 'クリックで文字を配置(プロパティで編集)',
-      room: '頂点を順にクリック / ダブルクリックまたは始点クリックで閉じる',
+      room: params.room.mode === 'rect'
+        ? '2点クリックで長方形の部屋 / 数値入力+Enter で寸法指定(幅,奥行) / Tab またはカーソル上のアイコンでモード切替'
+        : '頂点を順にクリック / ダブルクリックまたは始点クリックで閉じる / Tab: 長方形モード',
+      pencil: params.pencil.mode === 'rect'
+        ? '2点クリックで長方形を描く / 数値入力+Enter で寸法指定(幅,奥行) / Tab: 鉛筆モード'
+        : 'クリックで線を描く(閉じると面になる) / 数値入力+Enter で長さ指定 / 右クリックで終了 / Tab: 長方形モード',
       component: 'クリックでコンポーネントを配置 / R: 90°回転'
     }
     this.setHint(hints[this.tool])
@@ -235,13 +272,28 @@ export class ToolManager {
     const rect = this.canvas.getBoundingClientRect()
     return this.r.vp.toWorld(pt(e.clientX - rect.left, e.clientY - rect.top))
   }
+  /** 延長スナップの対象セグメント(壁の中心線 + 部屋の辺 + スケッチの辺) */
+  private extSegments(excludeWallId?: string): { a: Pt; b: Pt }[] {
+    const out: { a: Pt; b: Pt }[] = []
+    for (const e of this.store.doc.entities) {
+      if (e.hidden) continue
+      if (e.type === 'wall' && e.id !== excludeWallId) out.push({ a: e.a, b: e.b })
+      else if (e.type === 'room') {
+        for (let i = 0; i < e.poly.length; i++) out.push({ a: e.poly[i], b: e.poly[(i + 1) % e.poly.length] })
+      } else if (e.type === 'sketch') {
+        for (const ed of e.edges) out.push({ a: ed.a, b: ed.b })
+      }
+    }
+    return out
+  }
+
   private snapPoint(p: Pt, excludeWallId?: string): Pt {
     if (this.snapDirty) this.buildSnapCache()
     const tol = 12 / this.r.vp.zoom
     this.snapGuides = []
     // 優先度順に候補を探す(CAD 流)
     this.lastSnapRef = null
-    const PRIORITY = ['端点', '交点', '中点', '中心', '図心', '仮想交点']
+    const PRIORITY = ['端点', '交点', '中点', '中心', '図心', '仮想交点'].filter(k => this.snapEnabled[k])
     for (const kind of PRIORITY) {
       let best: { p: Pt; wallId?: string; ref?: DimAnchor } | null = null
       let bd = tol
@@ -270,24 +322,50 @@ export class ToolManager {
         return { ...best.p }
       }
     }
-    // 延長: 壁の中心線の延長線上(端から 3000mm 以内)
-    let bestExt: { p: Pt; from: Pt } | null = null
-    let bd = tol
-    for (const w of this.store.walls()) {
-      if (w.id === excludeWallId) continue
-      const dW = norm(sub(w.b, w.a))
-      const L = dist(w.a, w.b)
-      const t = (p.x - w.a.x) * dW.x + (p.y - w.a.y) * dW.y
-      if (t >= -1 && t <= L + 1) continue // セグメント内は対象外
-      if (t < -3000 || t > L + 3000) continue
-      const foot = pt(w.a.x + dW.x * t, w.a.y + dW.y * t)
-      const dd = dist(p, foot)
-      if (dd < bd) { bd = dd; bestExt = { p: foot, from: t < 0 ? w.a : w.b } }
+    // 延長: 壁・部屋・スケッチ辺の延長線上(端から 3000mm 以内)。
+    // グリッドの角点で一旦止まる(延長方向に沿ってグリッドへ吸着)
+    if (this.snapEnabled['延長']) {
+      let bestExt: { p: Pt; from: Pt; d: Pt } | null = null
+      let bd = tol
+      for (const s of this.extSegments(excludeWallId)) {
+        const dW = norm(sub(s.b, s.a))
+        const L = dist(s.a, s.b)
+        if (L < 1) continue
+        const t = (p.x - s.a.x) * dW.x + (p.y - s.a.y) * dW.y
+        if (t >= -1 && t <= L + 1) continue // セグメント内は対象外
+        if (t < -3000 || t > L + 3000) continue
+        const foot = pt(s.a.x + dW.x * t, s.a.y + dW.y * t)
+        const dd = dist(p, foot)
+        if (dd < bd) { bd = dd; bestExt = { p: foot, from: t < 0 ? s.a : s.b, d: dW } }
+      }
+      if (bestExt) {
+        // 延長線に沿ってグリッド角点へ吸着(軸平行なら座標を、斜めは距離を丸める)
+        let foot = bestExt.p
+        if (this.snapStep > 0) {
+          if (Math.abs(bestExt.d.x) > 0.999) foot = pt(snapTo(foot.x, this.snapStep), foot.y)
+          else if (Math.abs(bestExt.d.y) > 0.999) foot = pt(foot.x, snapTo(foot.y, this.snapStep))
+          else {
+            const along = (foot.x - bestExt.from.x) * bestExt.d.x + (foot.y - bestExt.from.y) * bestExt.d.y
+            const sn = snapTo(along, this.snapStep)
+            foot = pt(bestExt.from.x + bestExt.d.x * sn, bestExt.from.y + bestExt.d.y * sn)
+          }
+        }
+        this.snapKind = '延長'
+        this.snapGuides = [{ a: bestExt.from, b: foot }]
+        return { ...foot }
+      }
     }
-    if (bestExt) {
-      this.snapKind = '延長'
-      this.snapGuides = [{ a: bestExt.from, b: bestExt.p }]
-      return { ...bestExt.p }
+    // 線上: スケッチ辺の上の任意の点(辺の途中から線を引ける)
+    if (this.snapEnabled['線上']) {
+      for (const e of this.store.doc.entities) {
+        if (e.type !== 'sketch' || e.hidden) continue
+        for (const ed of e.edges) {
+          if (distToSeg(p, ed.a, ed.b) < tol) {
+            this.snapKind = '線上'
+            return lerp(ed.a, ed.b, projT(p, ed.a, ed.b))
+          }
+        }
+      }
     }
     this.snapKind = this.snapStep > 0 ? 'グリッド' : null
     return pt(snapTo(p.x, this.snapStep), snapTo(p.y, this.snapStep))
@@ -304,11 +382,11 @@ export class ToolManager {
 
   // ---------- ヒットテスト ----------
   hitTest(p: Pt): Entity | null {
-    const ents = this.store.doc.entities
+    const ents = this.store.doc.entities.filter(e => !e.hidden)
     const walls = new Map<string, Wall>()
     for (const e of ents) if (e.type === 'wall') walls.set(e.id, e)
     const tol = 10 / this.r.vp.zoom
-    // 優先度: 小物 → 壁 → 部屋
+    // 優先度: 小物 → スケッチの辺 → 壁 → 部屋 → スケッチの面
     for (let i = ents.length - 1; i >= 0; i--) {
       const e = ents[i]
       if (e.type === 'opening') {
@@ -327,13 +405,91 @@ export class ToolManager {
     }
     for (let i = ents.length - 1; i >= 0; i--) {
       const e = ents[i]
+      if (e.type === 'sketch' && e.edges.some(ed => distToSeg(p, ed.a, ed.b) < tol * 1.5)) return e
+    }
+    for (let i = ents.length - 1; i >= 0; i--) {
+      const e = ents[i]
       if (e.type === 'wall' && distToSeg(p, e.a, e.b) < e.thickness / 2 + tol) return e
     }
     for (let i = ents.length - 1; i >= 0; i--) {
       const e = ents[i]
       if (e.type === 'room' && pointInPoly(p, e.poly)) return e
     }
+    for (let i = ents.length - 1; i >= 0; i--) {
+      const e = ents[i]
+      if (e.type === 'sketch' && sketchFaces(e).some(f => pointInPoly(p, f))) return e
+    }
     return null
+  }
+
+  // ---------- スケッチ(鉛筆)のサブ選択: クリック回数で 全体→面→閉路→辺 ----------
+  private setSketchSub(sub: { id: string; mode: 'face' | 'loop' | 'edge'; faceIdx?: number; edgeIdx?: number } | null): void {
+    this.r.sketchSub = sub
+    this.onSketchSub(sub)
+  }
+  /** サブ選択の変化(消しゴムボタンの表示切替などに使う) */
+  onSketchSub: (sub: { id: string; mode: 'face' | 'loop' | 'edge'; faceIdx?: number; edgeIdx?: number } | null) => void = () => {}
+  get sketchSub(): { id: string; mode: 'face' | 'loop' | 'edge'; faceIdx?: number; edgeIdx?: number } | null {
+    return this.r.sketchSub
+  }
+  private cycleSketchSub(e: SketchE, p: Pt): void {
+    const cur = this.r.sketchSub?.id === e.id ? this.r.sketchSub : null
+    const faces = sketchFaces(e)
+    const faceIdx = ((): number => {
+      // クリック位置を含む最小の面(入れ子は内側を優先)
+      let best = -1, bestArea = Infinity
+      faces.forEach((f, i) => {
+        if (!pointInPoly(p, f)) return
+        const a = Math.abs(polyArea(f))
+        if (a < bestArea) { bestArea = a; best = i }
+      })
+      return best
+    })()
+    const edgeIdx = ((): number => {
+      let best = -1, bd = 20 / this.r.vp.zoom + 40
+      e.edges.forEach((ed, i) => {
+        const d = distToSeg(p, ed.a, ed.b)
+        if (d < bd) { bd = d; best = i }
+      })
+      return best
+    })()
+    // 全体 → 面 → 閉路 → 辺 → 全体(面がなければ 全体 → 辺 → 全体)
+    if (!cur) {
+      if (faceIdx >= 0) this.setSketchSub({ id: e.id, mode: 'face', faceIdx })
+      else if (edgeIdx >= 0) this.setSketchSub({ id: e.id, mode: 'edge', edgeIdx })
+    } else if (cur.mode === 'face') {
+      this.setSketchSub({ id: e.id, mode: 'loop', faceIdx: cur.faceIdx })
+    } else if (cur.mode === 'loop') {
+      if (edgeIdx >= 0) this.setSketchSub({ id: e.id, mode: 'edge', edgeIdx })
+      else this.setSketchSub(null)
+    } else {
+      this.setSketchSub(null)
+    }
+    this.r.requestDraw()
+  }
+  /** 選択中の面(または内側の立体)を削除 = 貫通穴にする(消しゴムアイコン) */
+  eraseSelectedFace(): void {
+    const sub = this.r.sketchSub
+    if (!sub || sub.faceIdx === undefined) return
+    const e = this.store.byId(sub.id)
+    if (e?.type !== 'sketch') return
+    const faces = sketchFaces(e)
+    const f = faces[sub.faceIdx]
+    if (!f) return
+    this.store.commit()
+    e.faces ??= {}
+    const info = faceInfo(e, f)
+    e.faces[faceKey(f)] = { ...info, dead: true, h: undefined }
+    this.setSketchSub(null)
+    this.store.emit()
+  }
+  /** 選択中の面の押し出し高さを設定(プロパティ・3D の円錐つまみから) */
+  setFaceHeight(id: string, poly: Pt[], h: number): void {
+    const e = this.store.byId(id)
+    if (e?.type !== 'sketch') return
+    e.faces ??= {}
+    const info = faceInfo(e, poly)
+    e.faces[faceKey(poly)] = { ...info, h: h > 0 ? h : undefined, dead: false }
   }
 
   // ---------- ポインタイベント ----------
@@ -350,6 +506,28 @@ export class ToolManager {
       return
     }
     if (e.button !== 0) return
+    // カーソル上のモード切替アイコン(鉛筆 / 長方形)のクリック
+    if ((this.tool === 'room' || this.tool === 'pencil') && !this.rectStart && !this.penPts.length && !this.roomPts.length) {
+      for (const ic of this.modeIcons) {
+        if (dist(p, ic.c) < ic.r) {
+          const pr = this.tool === 'room' ? params.room : params.pencil
+          pr.mode = ic.mode
+          this.updateHint()
+          this.onToolChange(this.tool) // ツール設定パネルを更新
+          this.r.requestDraw()
+          return
+        }
+      }
+    }
+    // 基準点複写: 最初のクリック = コピーの基準点
+    if (this.dupAwaitBase) {
+      const base = this.snapPoint(p)
+      this.dupAwaitBase = false
+      this.dupFrom = base
+      this.canvas.style.cursor = ''
+      this.onDupBase(base)
+      return
+    }
     const sp = this.snapPoint(p)
 
     switch (this.tool) {
@@ -373,9 +551,16 @@ export class ToolManager {
           if (!this.r.selection.has(hit.id)) {
             if (!e.shiftKey) this.r.selection.clear()
             this.r.selection.add(hit.id)
+            this.setSketchSub(null)
             this.store.expandGroups(this.r.selection) // グループはまとめて選択
           } else if (e.shiftKey) {
             this.r.selection.delete(hit.id)
+          } else if (this.r.selection.size === 1 && hit.type === 'sketch') {
+            // スケッチの再クリック: 全体 → 面 → 閉路 → 辺 と選択を絞り込む
+            this.cycleSketchSub(hit, p)
+            this.onSelectionChange()
+            this.r.requestDraw()
+            return
           } else if (this.r.selection.size > 1) {
             // 複数選択のメンバー再クリック: ドラッグ=全体移動 / クリックだけなら単体に絞る(up で判定)
             this.drillPending = hit.id
@@ -390,7 +575,7 @@ export class ToolManager {
           this.store.commit()
         } else {
           // 何もない場所からのドラッグ → 範囲選択(Shift で追加選択)
-          if (!e.shiftKey) this.r.selection.clear()
+          if (!e.shiftKey) { this.r.selection.clear(); this.setSketchSub(null) }
           this.marquee = { start: p, cur: p, additive: e.shiftKey }
         }
         this.onSelectionChange()
@@ -399,7 +584,7 @@ export class ToolManager {
       }
       case 'wall': case 'door': case 'window': case 'stair': case 'column':
       case 'furniture': case 'equipment': case 'planting': case 'label': case 'component':
-      case 'dimension': case 'room':
+      case 'dimension': case 'room': case 'pencil':
         this.placeAt(p, { shift: e.shiftKey })
         break
     }
@@ -421,6 +606,19 @@ export class ToolManager {
     }
     this.cursor = this.snapPoint(p)
     if (this.tool === 'wall' && this.wallStart && e.shiftKey) this.cursor = this.ortho(this.wallStart, this.cursor)
+    // 基準点複写: 基準点からの水平・垂直・45°(対角)へ吸着
+    if (this.tool === 'component' && this.dupFrom && this.snapKind === 'グリッド') {
+      const v = sub(this.cursor, this.dupFrom)
+      const L = Math.hypot(v.x, v.y)
+      if (L > 1) {
+        const deg = (Math.atan2(v.y, v.x) * 180) / Math.PI
+        const snapped = angleDetentDeg(deg, 4)
+        if (snapped !== deg) {
+          const rad = (snapped * Math.PI) / 180
+          this.cursor = add(this.dupFrom, pt(Math.cos(rad) * L, Math.sin(rad) * L))
+        }
+      }
+    }
 
     // 変形つまみの上では OS の「つかむ手」カーソル
     if (this.tool === 'select' && !this.dragging && !this.handleDrag && !this.marquee) {
@@ -513,6 +711,16 @@ export class ToolManager {
       }
     } else if (ent.type === 'room' && orig.type === 'room') {
       ent.poly = orig.poly.map(q => add(q, d))
+    } else if (ent.type === 'sketch' && orig.type === 'sketch') {
+      ent.edges = orig.edges.map(ed => ({ ...ed, a: add(ed.a, d), b: add(ed.b, d) }))
+      // 面キー(図心)も一緒に平行移動して押し出し高さを保つ
+      if (orig.faces) {
+        ent.faces = {}
+        for (const [k, v] of Object.entries(orig.faces)) {
+          const [x, y] = k.split(':').map(Number)
+          ent.faces[`${Math.round(x + d.x)}:${Math.round(y + d.y)}`] = v
+        }
+      }
     } else if (ent.type === 'dimension' && orig.type === 'dimension') {
       ent.a = add(orig.a, d); ent.b = add(orig.b, d)
       ent.anchorA = undefined; ent.anchorB = undefined // 手動移動で従属を解除
@@ -562,6 +770,7 @@ export class ToolManager {
   }
 
   private dblclick(): void {
+    if (this.tool === 'pencil' && this.penPts.length) { this.penPts = []; this.penTarget = null; this.r.requestDraw(); return }
     if (this.tool === 'room' && this.roomPts.length >= 3) { this.closeRoom(); return }
     if (this.tool === 'select') {
       const hit = this.hitTest(this.rawCursor)
@@ -600,14 +809,130 @@ export class ToolManager {
 
   cancel(): void {
     this.wallStart = null; this.arcEnd = null; this.dimPts = []; this.roomPts = []
+    this.rectStart = null; this.penPts = []; this.penTarget = null; this.numBuf = ''
+    this.dupAwaitBase = false; this.dupFrom = null
+    this.canvas.style.cursor = ''
+    this.r.requestDraw()
+  }
+
+  /**
+   * 作図中の Undo(⌘Z): 今引いている線・入力バッファを取り消す。
+   * 取り消すものがなければ false(通常の Undo に委ねる)
+   */
+  undoDraft(): boolean {
+    if (this.numBuf) { this.numBuf = ''; this.r.requestDraw(); return true }
+    if (this.rectStart) { this.rectStart = null; this.r.requestDraw(); return true }
+    if (this.tool === 'wall' && (this.wallStart || this.arcEnd)) {
+      this.arcEnd = null; this.wallStart = null
+      this.r.requestDraw(); return true
+    }
+    if (this.tool === 'room' && this.roomPts.length) {
+      this.roomPts.pop(); this.r.requestDraw(); return true
+    }
+    if (this.tool === 'pencil' && this.penPts.length) {
+      if (this.penPts.length >= 2) this.store.undo() // 直前の辺を取り消す
+      this.penPts.pop()
+      if (!this.penPts.length) this.penTarget = null
+      this.r.requestDraw(); return true
+    }
+    if (this.tool === 'dimension' && this.dimPts.length) {
+      this.dimPts.pop(); this.dimRefs.pop(); this.r.requestDraw(); return true
+    }
+    return false
+  }
+
+  // ---------- 基準点複写 ----------
+  /** 複製アイコン → 基準点の選択待ちへ(カーソルが十字になる) */
+  beginDuplicate(): void {
+    this.dupAwaitBase = true
+    this.canvas.style.cursor = 'crosshair'
+    this.setHint('コピーの基準にする点をクリックしてください(端点・交点などに吸着)')
+  }
+  get awaitingDupBase(): boolean { return this.dupAwaitBase }
+  /** 基準点が決まったとき(main 側でコンポーネント化して配置モードへ) */
+  onDupBase: (base: Pt) => void = () => {}
+  get dupBase(): Pt | null { return this.dupFrom }
+
+  /** 数値入力バッファ(部屋・鉛筆の寸法指定)を確定 */
+  private applyNumBuf(): void {
+    const buf = this.numBuf
+    this.numBuf = ''
+    if (!buf) return
+    const nums = buf.split(/[,xX]/).map(s => parseFloat(s)).filter(v => !Number.isNaN(v) && v > 0)
+    if (!nums.length) return
+    const c = this.cursor
+    if (this.rectStart) {
+      // 長方形: 「幅,奥行」(1 つなら正方形)。向きは現在のカーソル側
+      const w = nums[0], d = nums[1] ?? nums[0]
+      const sx = c.x >= this.rectStart.x ? 1 : -1
+      const sy = c.y >= this.rectStart.y ? 1 : -1
+      const end = pt(this.rectStart.x + w * sx, this.rectStart.y + d * sy)
+      this.commitRect(this.rectStart, end)
+      this.rectStart = null
+    } else if (this.tool === 'pencil' && this.penPts.length) {
+      // 鉛筆の線: 長さ指定(現在のカーソル方向へ)
+      const last = this.penPts[this.penPts.length - 1]
+      const dir = norm(sub(c, last))
+      if (dir.x || dir.y) {
+        const next = add(last, pt(dir.x * nums[0], dir.y * nums[0]))
+        this.addSketchEdge(last, next)
+        this.penPts.push(next)
+      }
+    } else if (this.tool === 'room' && this.roomPts.length) {
+      const last = this.roomPts[this.roomPts.length - 1]
+      const dir = norm(sub(c, last))
+      if (dir.x || dir.y) this.roomPts.push(add(last, pt(dir.x * nums[0], dir.y * nums[0])))
+    }
     this.r.requestDraw()
   }
 
   key(e: KeyboardEvent): void {
     if (e.key === ' ') { this.spaceDown = e.type === 'keydown'; return }
     if (e.type !== 'keydown') return
-    if (e.key === 'Escape') { this.cancel(); this.r.selection.clear(); this.onSelectionChange(); return }
+    if (e.key === 'Escape') {
+      // Esc: 作図キャンセル + 選択解除 + 選択ツールへ戻る
+      this.cancel()
+      this.r.selection.clear()
+      this.setSketchSub(null)
+      this.onSelectionChange()
+      if (this.tool !== 'select') this.setTool('select')
+      return
+    }
+    // 数値キーボードで寸法入力(部屋・鉛筆の作図中)
+    if ((this.tool === 'room' || this.tool === 'pencil') &&
+      (this.rectStart || this.penPts.length || this.roomPts.length)) {
+      if (/^[0-9.,]$/.test(e.key) || (e.key.toLowerCase() === 'x' && this.numBuf)) {
+        this.numBuf += e.key
+        this.r.requestDraw()
+        return
+      }
+      if (e.key === 'Backspace' && this.numBuf) {
+        this.numBuf = this.numBuf.slice(0, -1)
+        this.r.requestDraw()
+        return
+      }
+      if (e.key === 'Enter' && this.numBuf) {
+        this.applyNumBuf()
+        return
+      }
+    }
     if (e.key === 'Delete' || e.key === 'Backspace') {
+      // スケッチのサブ選択中: 辺だけ / 面だけを削除(辺を消すと面はマージされる)
+      const sub = this.r.sketchSub
+      if (sub) {
+        const ent = this.store.byId(sub.id)
+        if (ent?.type === 'sketch') {
+          if (sub.mode === 'edge' && sub.edgeIdx !== undefined) {
+            this.store.commit()
+            ent.edges.splice(sub.edgeIdx, 1)
+            if (!ent.edges.length) this.store.remove(new Set([ent.id]))
+            this.setSketchSub(null)
+            this.store.emit()
+            return
+          }
+          if (sub.faceIdx !== undefined) { this.eraseSelectedFace(); return }
+        }
+      }
       if (this.r.selection.size) {
         this.store.commit()
         this.store.remove(this.r.selection)
@@ -616,10 +941,16 @@ export class ToolManager {
       }
       return
     }
-    if (e.key === 'Tab' && this.tool === 'stair') {
+    if (e.key === 'Tab' && (this.tool === 'stair' || this.tool === 'room' || this.tool === 'pencil')) {
       e.preventDefault()
-      const kinds: StairKind[] = ['straight', 'l', 'u', 'spiral']
-      params.stair.kind = kinds[(kinds.indexOf(params.stair.kind) + 1) % kinds.length]
+      if (this.tool === 'stair') {
+        const kinds: StairKind[] = ['straight', 'l', 'u', 'spiral']
+        params.stair.kind = kinds[(kinds.indexOf(params.stair.kind) + 1) % kinds.length]
+      } else {
+        const pr = this.tool === 'room' ? params.room : params.pencil
+        pr.mode = pr.mode === 'rect' ? 'poly' : 'rect'
+        this.updateHint()
+      }
       this.onToolChange(this.tool) // ツール設定パネルを更新
       this.r.requestDraw()
       return
@@ -645,7 +976,7 @@ export class ToolManager {
     }
     const map: Record<string, ToolName> = {
       v: 'select', w: 'wall', c: 'column', d: 'door', n: 'window', s: 'stair',
-      f: 'furniture', e: 'equipment', p: 'planting', m: 'dimension', t: 'label', a: 'room'
+      f: 'furniture', e: 'equipment', p: 'planting', m: 'dimension', t: 'label', a: 'room', l: 'pencil'
     }
     if (map[k] && !e.metaKey && !e.ctrlKey) this.setTool(map[k])
   }
@@ -765,6 +1096,21 @@ export class ToolManager {
         const xs = ent.poly.map(q => q.x), ys = ent.poly.map(q => q.y)
         const c = pt((Math.min(...xs) + Math.max(...xs)) / 2, (Math.min(...ys) + Math.max(...ys)) / 2)
         ent.poly = ent.poly.map(q => pt(c.x - (q.y - c.y), c.y + (q.x - c.x)))
+      } else if (ent.type === 'sketch') {
+        const ps = ent.edges.flatMap(ed => [ed.a, ed.b])
+        const xs = ps.map(q => q.x), ys = ps.map(q => q.y)
+        const c = pt((Math.min(...xs) + Math.max(...xs)) / 2, (Math.min(...ys) + Math.max(...ys)) / 2)
+        const rot90 = (q: Pt): Pt => pt(c.x - (q.y - c.y), c.y + (q.x - c.x))
+        ent.edges = ent.edges.map(ed => ({ ...ed, a: rot90(ed.a), b: rot90(ed.b) }))
+        if (ent.faces) {
+          const nf: typeof ent.faces = {}
+          for (const [k, v] of Object.entries(ent.faces)) {
+            const [x, y] = k.split(':').map(Number)
+            const q = rot90(pt(x, y))
+            nf[`${Math.round(q.x)}:${Math.round(q.y)}`] = v
+          }
+          ent.faces = nf
+        }
       }
     }
     this.store.emit(); this.onSelectionChange()
@@ -790,10 +1136,17 @@ export class ToolManager {
             this.arcEnd = null
           }
         } else if (dist(this.wallStart, q) > 1) {
+          // クリックした線 = 基準線(通り芯)。壁の本体は 右 offR / 左 offL の設定に従って配置
+          const n = perp(norm(sub(q, this.wallStart)))
+          const shift = (params.wall.offR - params.wall.offL) / 2
           this.store.commit()
           this.store.add({
-            id: uid(), type: 'wall', a: this.wallStart, b: q,
-            thickness: params.wall.thickness, height: params.wall.height, structural: params.wall.structural
+            id: uid(), type: 'wall',
+            a: add(this.wallStart, pt(n.x * shift, n.y * shift)),
+            b: add(q, pt(n.x * shift, n.y * shift)),
+            thickness: params.wall.offR + params.wall.offL,
+            height: params.wall.height, structural: params.wall.structural,
+            refOff: shift === 0 ? undefined : -shift
           })
           this.wallStart = q
         }
@@ -881,14 +1234,87 @@ export class ToolManager {
         break
       }
       case 'room': {
-        if (this.roomPts.length >= 3 && dist(sp, this.roomPts[0]) < Math.max(300, 20 / this.r.vp.zoom)) {
+        if (params.room.mode === 'rect') {
+          // 長方形モード: 2点(対角)で部屋を作る
+          if (!this.rectStart) this.rectStart = sp
+          else { this.commitRect(this.rectStart, sp); this.rectStart = null }
+        } else if (this.roomPts.length >= 3 && dist(sp, this.roomPts[0]) < Math.max(300, 20 / this.r.vp.zoom)) {
           this.closeRoom()
         } else {
           this.roomPts.push(sp)
         }
         break
       }
+      case 'pencil': {
+        if (params.pencil.mode === 'rect') {
+          if (!this.rectStart) this.rectStart = sp
+          else { this.commitRect(this.rectStart, sp); this.rectStart = null }
+        } else if (!this.penPts.length) {
+          this.penPts = [sp]
+          this.penTarget = this.sketchAt(sp)?.id ?? null // 既存スケッチの上から始めたら追記
+        } else if (dist(sp, this.penPts[this.penPts.length - 1]) > 1) {
+          this.addSketchEdge(this.penPts[this.penPts.length - 1], sp)
+          // 始点に戻って閉じたらストローク終了(SketchUp 流)
+          if (this.penPts.length >= 2 && dist(sp, this.penPts[0]) < Math.max(100, 10 / this.r.vp.zoom)) {
+            this.penPts = []
+            this.penTarget = null
+          } else {
+            this.penPts.push(sp)
+          }
+        }
+        break
+      }
     }
+  }
+
+  // ---------- 長方形(部屋・鉛筆共通)とスケッチ辺の確定 ----------
+  private commitRect(a: Pt, b: Pt): void {
+    if (Math.abs(b.x - a.x) < 1 || Math.abs(b.y - a.y) < 1) return
+    const poly = [pt(a.x, a.y), pt(b.x, a.y), pt(b.x, b.y), pt(a.x, b.y)]
+    if (this.tool === 'room') {
+      this.store.commit()
+      this.store.add({ id: uid(), type: 'room', poly, name: '部屋', use: params.room.use, showArea: true })
+    } else {
+      this.store.commit()
+      const target = this.sketchAt(a) ?? this.sketchAt(b)
+      const edges = poly.map((q, i) => ({ a: q, b: poly[(i + 1) % 4], color: params.pencil.color }))
+      if (target) { target.edges.push(...edges); this.store.emit() }
+      else this.store.add({ id: uid(), type: 'sketch', edges })
+    }
+  }
+  /** p の近くにあるスケッチ(辺 5mm 以内 or 面の内側) */
+  private sketchAt(p: Pt): SketchE | null {
+    for (const e of this.store.doc.entities) {
+      if (e.type !== 'sketch' || e.hidden) continue
+      if (e.edges.some(ed => distToSeg(p, ed.a, ed.b) < 5)) return e
+      if (sketchFaces(e).some(f => pointInPoly(p, f))) return e
+    }
+    return null
+  }
+  /** 鉛筆: 辺を 1 本追加(必要ならスケッチを新規作成 / 触れた別のスケッチとマージ) */
+  private addSketchEdge(a: Pt, b: Pt): void {
+    this.store.commit()
+    let target = this.penTarget ? this.store.byId(this.penTarget) as SketchE | undefined : undefined
+    if (target?.type !== 'sketch') target = undefined
+    if (!target) {
+      target = { id: uid(), type: 'sketch', edges: [] }
+      this.store.doc.entities.push(target)
+      this.penTarget = target.id
+    }
+    target.edges.push({ a: { ...a }, b: { ...b }, color: params.pencil.color })
+    // 終点が別のスケッチに触れたらマージ(またいで閉路が作れる)
+    for (const e of [...this.store.doc.entities]) {
+      if (e.type !== 'sketch' || e === target || e.hidden) continue
+      const touch = e.edges.some(ed =>
+        distToSeg(b, ed.a, ed.b) < 5 || dist(a, ed.a) < 5 || dist(a, ed.b) < 5)
+      if (touch) {
+        target.edges.push(...e.edges)
+        target.faces = { ...e.faces, ...target.faces }
+        this.store.remove(new Set([e.id]))
+        break
+      }
+    }
+    this.store.emit()
   }
 
   // ---------- コンポーネント配置 ----------
@@ -915,6 +1341,18 @@ export class ToolManager {
       else if (c.type === 'opening') { c.wallId = idMap.get(c.wallId) ?? c.wallId }
       else if (c.type === 'room') c.poly = c.poly.map(tr)
       else if (c.type === 'dimension') { c.a = tr(c.a); c.b = tr(c.b) }
+      else if (c.type === 'sketch') {
+        c.edges = c.edges.map(ed => ({ ...ed, a: tr(ed.a), b: tr(ed.b) }))
+        if (c.faces) {
+          const nf: typeof c.faces = {}
+          for (const [k, v] of Object.entries(c.faces)) {
+            const [x, y] = k.split(':').map(Number)
+            const q = tr(pt(x, y))
+            nf[`${Math.round(q.x)}:${Math.round(q.y)}`] = v
+          }
+          c.faces = nf
+        }
+      }
       else if ('pos' in c) {
         c.pos = tr((c as { pos: Pt }).pos)
         if ('rot' in c) (c as { rot: number }).rot += rot
@@ -998,6 +1436,36 @@ export class ToolManager {
         return ent.poly.map((v, i) => ({
           key: `v${i}`, pos: v, apply: (q: Pt) => { ent.poly[i] = q }
         }))
+      case 'sketch': {
+        // 辺サブ選択中: その辺の両端だけ / 通常: 全頂点(同じ位置の端点はまとめて動く=スケール変更)
+        const sub = this.r.sketchSub?.id === ent.id ? this.r.sketchSub : null
+        if (sub?.mode === 'edge' && sub.edgeIdx !== undefined && ent.edges[sub.edgeIdx]) {
+          const ed = ent.edges[sub.edgeIdx]
+          return (['a', 'b'] as const).map(end => ({
+            key: `e${end}`, pos: ed[end], apply: (q: Pt) => { ed[end] = q }
+          }))
+        }
+        const seen: Pt[] = []
+        const out: { key: string; pos: Pt; apply: (q: Pt) => void }[] = []
+        for (const ed of ent.edges) {
+          for (const p of [ed.a, ed.b]) {
+            if (seen.some(s => dist(s, p) < 3)) continue
+            seen.push(p)
+            out.push({
+              key: `v${out.length}`, pos: p,
+              apply: (q: Pt) => {
+                // 同じ位置にある端点(接続点)をまとめて動かす
+                const cur = { ...p }
+                for (const e2 of ent.edges) {
+                  if (dist(e2.a, cur) < 3) e2.a = { ...q }
+                  if (dist(e2.b, cur) < 3) e2.b = { ...q }
+                }
+              }
+            })
+          }
+        }
+        return out
+      }
       case 'furniture': case 'column': case 'custom': {
         const out: { key: string; pos: Pt; raw?: boolean; shape?: 'circle'; apply: (q: Pt) => void }[] = [
           rotHandle(ent, ent.d / 2 + 24 / this.r.vp.zoom)
@@ -1120,6 +1588,12 @@ export class ToolManager {
       } else if (e.type === 'dimension') {
         e.a = tr(e.a); e.b = tr(e.b)
         drawDimension(ctx, e, zoom)
+      } else if (e.type === 'sketch') {
+        ctx.strokeStyle = '#1f2937'; ctx.lineWidth = 1 / zoom
+        for (const ed of e.edges) {
+          const a2 = tr(ed.a), b2 = tr(ed.b)
+          ctx.beginPath(); ctx.moveTo(a2.x, a2.y); ctx.lineTo(b2.x, b2.y); ctx.stroke()
+        }
       } else if ('pos' in e) {
         ;(e as { pos: Pt }).pos = tr((e as { pos: Pt }).pos)
         if ('rot' in e) (e as { rot: number }).rot += rot
@@ -1372,16 +1846,31 @@ export class ToolManager {
       for (const q of this.dimPts.slice(1)) ctx.lineTo(q.x, q.y)
       ctx.lineTo(c.x, c.y)
       ctx.stroke()
-    } else if (this.tool === 'room' && this.roomPts.length) {
+    } else if ((this.tool === 'room' || this.tool === 'pencil') && this.rectStart) {
+      // 長方形モードのプレビュー(部屋・鉛筆共通): 外形 + 縦横寸法 + 面積
+      const a = this.rectStart
+      ctx.lineWidth = 1 / zoom
+      ctx.strokeRect(Math.min(a.x, c.x), Math.min(a.y, c.y), Math.abs(c.x - a.x), Math.abs(c.y - a.y))
+      ctx.globalAlpha = 1
+      this.edgeLen(ctx, zoom, pt(a.x, a.y), pt(c.x, a.y))
+      this.edgeLen(ctx, zoom, pt(c.x, a.y), pt(c.x, c.y))
+      const areaM2 = Math.abs((c.x - a.x) * (c.y - a.y)) / 1e6
+      if (areaM2 > 0.01) {
+        ctx.font = `${13 / zoom}px sans-serif`
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
+        ctx.fillText(`${areaM2.toFixed(2)} m²`, (a.x + c.x) / 2, (a.y + c.y) / 2)
+      }
+    } else if ((this.tool === 'room' && this.roomPts.length) || (this.tool === 'pencil' && this.penPts.length)) {
+      // 多角形(部屋)・鉛筆の共通プレビュー: 折れ線 + 各辺の寸法 + 面積
+      const base = this.tool === 'room' ? this.roomPts : this.penPts
       ctx.lineWidth = 1 / zoom
       ctx.beginPath()
-      ctx.moveTo(this.roomPts[0].x, this.roomPts[0].y)
-      for (const q of this.roomPts.slice(1)) ctx.lineTo(q.x, q.y)
+      ctx.moveTo(base[0].x, base[0].y)
+      for (const q of base.slice(1)) ctx.lineTo(q.x, q.y)
       ctx.lineTo(c.x, c.y)
       ctx.stroke()
-      // 各辺の寸法と現在の面積を表示
       ctx.globalAlpha = 1
-      const pts = [...this.roomPts, c]
+      const pts = [...base, c]
       for (let i = 0; i < pts.length - 1; i++) this.edgeLen(ctx, zoom, pts[i], pts[i + 1])
       if (pts.length >= 3) {
         const areaM2 = Math.abs(polyArea(pts)) / 1e6
@@ -1393,5 +1882,70 @@ export class ToolManager {
       }
     }
     ctx.globalAlpha = 1
+
+    // 基準点複写のガイド: 基準点 → カーソルの点線 + 距離(水平垂直・対角は角度吸着)
+    if (this.tool === 'component' && this.dupFrom) {
+      const f = this.dupFrom
+      ctx.save()
+      ctx.strokeStyle = '#16a34a'; ctx.fillStyle = '#16a34a'
+      ctx.lineWidth = 1 / zoom
+      const R = 6 / zoom
+      ctx.beginPath()
+      ctx.moveTo(f.x - R, f.y); ctx.lineTo(f.x + R, f.y)
+      ctx.moveTo(f.x, f.y - R); ctx.lineTo(f.x, f.y + R)
+      ctx.stroke()
+      ctx.setLineDash([8 / zoom, 5 / zoom])
+      ctx.beginPath(); ctx.moveTo(f.x, f.y); ctx.lineTo(c.x, c.y); ctx.stroke()
+      ctx.setLineDash([])
+      const L = Math.round(dist(f, c))
+      if (L > 1) {
+        ctx.font = `${12 / zoom}px sans-serif`
+        ctx.textAlign = 'center'; ctx.textBaseline = 'bottom'
+        ctx.fillText(`${L}`, (f.x + c.x) / 2, (f.y + c.y) / 2 - 6 / zoom)
+      }
+      ctx.restore()
+    }
+
+    // 数値入力バッファ(Enter で確定)
+    if (this.numBuf) {
+      ctx.save()
+      ctx.font = `${13 / zoom}px sans-serif`
+      const label = `${this.numBuf} ⏎`
+      const w = ctx.measureText(label).width + 14 / zoom
+      ctx.fillStyle = '#1d4ed8'
+      ctx.fillRect(c.x + 14 / zoom, c.y + 12 / zoom, w, 20 / zoom)
+      ctx.fillStyle = '#ffffff'
+      ctx.textAlign = 'left'; ctx.textBaseline = 'middle'
+      ctx.fillText(label, c.x + 21 / zoom, c.y + 22 / zoom)
+      ctx.restore()
+    }
+
+    // 部屋・鉛筆ツール: カーソル上のモード切替アイコン(✎ 鉛筆 / ▭ 長方形)
+    this.modeIcons = []
+    if (this.tool === 'room' || this.tool === 'pencil') {
+      const mode = (this.tool === 'room' ? params.room : params.pencil).mode
+      const R = 11 / zoom
+      const cy0 = c.y - 32 / zoom
+      const defs: { mode: DrawMode; cx: number; glyph: string }[] = [
+        { mode: 'poly', cx: c.x + 24 / zoom, glyph: '✎' },
+        { mode: 'rect', cx: c.x + 24 / zoom + 26 / zoom, glyph: '▭' }
+      ]
+      ctx.save()
+      for (const dfn of defs) {
+        const active = dfn.mode === mode
+        ctx.beginPath(); ctx.arc(dfn.cx, cy0, R, 0, Math.PI * 2)
+        ctx.fillStyle = active ? '#2563eb' : 'rgba(255,255,255,0.92)'
+        ctx.fill()
+        ctx.strokeStyle = active ? '#1d4ed8' : '#9ca3af'
+        ctx.lineWidth = 1.2 / zoom
+        ctx.stroke()
+        ctx.fillStyle = active ? '#ffffff' : '#4b5563'
+        ctx.font = `${13 / zoom}px sans-serif`
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
+        ctx.fillText(dfn.glyph, dfn.cx, cy0 + 0.5 / zoom)
+        this.modeIcons.push({ c: pt(dfn.cx, cy0), r: R * 1.25, mode: dfn.mode })
+      }
+      ctx.restore()
+    }
   }
 }

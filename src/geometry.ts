@@ -121,6 +121,176 @@ export function polyContains(outer: Pt[], inner: Pt[]): boolean {
 export function netPolyArea(outer: Pt[], holes: Pt[][]): number {
   return Math.max(0, Math.abs(polyArea(outer)) - holes.reduce((s, h) => s + Math.abs(polyArea(h)), 0))
 }
+// ---------------- スケッチ(鉛筆ツール)の面検出 ----------------
+// 辺の集合から平面グラフを作り、最小閉路 = 面を求める(SketchUp 流)。
+// 辺は交点・他の辺の端点で自動分割されるので「辺の途中から線を引く」ことができる。
+
+const V_TOL = 2 // 頂点マージ許容 mm
+
+/** 2線分の交差パラメータ(両線分の内部)。平行・端点接触は null */
+function segParams(a1: Pt, a2: Pt, b1: Pt, b2: Pt): { t: number; u: number } | null {
+  const d1 = sub(a2, a1), d2 = sub(b2, b1)
+  const c = d1.x * d2.y - d1.y * d2.x
+  if (Math.abs(c) < 1e-9) return null
+  const t = ((b1.x - a1.x) * d2.y - (b1.y - a1.y) * d2.x) / c
+  const u = ((b1.x - a1.x) * d1.y - (b1.y - a1.y) * d1.x) / c
+  return t > 1e-6 && t < 1 - 1e-6 && u > 1e-6 && u < 1 - 1e-6 ? { t, u } : null
+}
+
+/**
+ * 辺の集合から面(閉路のポリゴン)を検出する。
+ * 半辺トレース: 逆向き辺から時計回りに次の辺を選ぶ → 内部面が符号付き面積 正、外周が負。
+ */
+export function computeFaces(edges: { a: Pt; b: Pt }[]): Pt[][] {
+  // 1. 辺を交点・端点で分割
+  interface Seg { a: Pt; b: Pt }
+  let segs: Seg[] = edges.filter(e => dist(e.a, e.b) > V_TOL).map(e => ({ a: { ...e.a }, b: { ...e.b } }))
+  const cuts: number[][] = segs.map(() => [])
+  for (let i = 0; i < segs.length; i++) {
+    for (let j = i + 1; j < segs.length; j++) {
+      const x = segParams(segs[i].a, segs[i].b, segs[j].a, segs[j].b)
+      if (x) { cuts[i].push(x.t); cuts[j].push(x.u) }
+    }
+    // 他の辺の端点がこの辺の上に載っている場合も分割(T字接続)
+    for (let j = 0; j < segs.length; j++) {
+      if (i === j) continue
+      for (const p of [segs[j].a, segs[j].b]) {
+        if (distToSeg(p, segs[i].a, segs[i].b) < V_TOL) {
+          const t = projT(p, segs[i].a, segs[i].b)
+          if (t > 1e-4 && t < 1 - 1e-4) cuts[i].push(t)
+        }
+      }
+    }
+  }
+  const split: Seg[] = []
+  segs.forEach((s, i) => {
+    const ts = [0, ...cuts[i].sort((a, b) => a - b), 1]
+    for (let k = 0; k < ts.length - 1; k++) {
+      if (ts[k + 1] - ts[k] < 1e-6) continue
+      split.push({ a: lerp(s.a, s.b, ts[k]), b: lerp(s.a, s.b, ts[k + 1]) })
+    }
+  })
+  segs = split
+
+  // 2. 頂点マージ + 隣接リスト
+  const vs: Pt[] = []
+  const vid = (p: Pt): number => {
+    for (let i = 0; i < vs.length; i++) if (dist(vs[i], p) < V_TOL) return i
+    vs.push({ ...p })
+    return vs.length - 1
+  }
+  const adjSet = new Map<number, Set<number>>()
+  const link = (u: number, v: number): void => {
+    if (u === v) return
+    if (!adjSet.has(u)) adjSet.set(u, new Set())
+    adjSet.get(u)!.add(v)
+  }
+  for (const s of segs) {
+    const u = vid(s.a), v = vid(s.b)
+    link(u, v); link(v, u)
+  }
+  // 角度順(昇順)の隣接リスト
+  const adj = new Map<number, number[]>()
+  for (const [u, set] of adjSet) {
+    adj.set(u, [...set].sort((p, q) =>
+      Math.atan2(vs[p].y - vs[u].y, vs[p].x - vs[u].x) - Math.atan2(vs[q].y - vs[u].y, vs[q].x - vs[u].x)))
+  }
+
+  // 3. 半辺トレース
+  const used = new Set<string>()
+  const faces: Pt[][] = []
+  for (const [u0, ns] of adj) {
+    for (const v0 of ns) {
+      if (used.has(`${u0}>${v0}`)) continue
+      const cyc: number[] = []
+      let u = u0, v = v0
+      for (let guard = 0; guard < 2000; guard++) {
+        used.add(`${u}>${v}`)
+        cyc.push(u)
+        const around = adj.get(v)!
+        const i = around.indexOf(u)
+        // 逆向き辺(v→u)の 1 つ手前(時計回りの次)を選ぶ
+        const w = around[(i - 1 + around.length) % around.length]
+        u = v; v = w
+        if (u === u0 && v === v0) break
+      }
+      const poly = cyc.map(i => vs[i])
+      if (poly.length >= 3 && polyArea(poly) > 1e3) faces.push(poly)
+    }
+  }
+  return faces
+}
+
+/** 面の永続キー(押し出し高さ・削除フラグの紐付け用): 図心ベース */
+export const faceKey = (poly: Pt[]): string => {
+  const c = polyCentroid(poly)
+  return `${Math.round(c.x)}:${Math.round(c.y)}`
+}
+
+export interface FaceInfo { h?: number; dead?: boolean }
+/** スケッチの面情報(押し出し高さ・削除フラグ)。キーは sketchFaces() 側で突き合わせ済み */
+export function faceInfo(sk: { faces?: Record<string, FaceInfo> }, poly: Pt[]): FaceInfo {
+  return sk.faces?.[faceKey(poly)] ?? {}
+}
+
+/**
+ * 面キーの突き合わせ: 頂点編集で図心が動いても、保存済みの面情報
+ * (押し出し高さなど)を新しい面へ 1 対 1 で引き継ぐ。
+ * 完全一致を優先し、残りは最寄り(800mm 以内)へ移行。
+ */
+function reconcileFaces(sk: { faces?: Record<string, FaceInfo> }, faces: Pt[][]): void {
+  if (!sk.faces) return
+  const keys = Object.keys(sk.faces)
+  if (!keys.length) return
+  const newKeys = faces.map(faceKey)
+  const out: Record<string, FaceInfo> = {}
+  const used = new Set<number>()
+  for (const k of keys) {
+    const idx = newKeys.indexOf(k)
+    if (idx >= 0 && !used.has(idx)) { out[k] = sk.faces[k]; used.add(idx) }
+  }
+  for (const k of keys) {
+    if (out[k] === sk.faces[k]) continue
+    const [x, y] = k.split(':').map(Number)
+    let best = -1
+    let bd = 800
+    faces.forEach((f, i) => {
+      if (used.has(i)) return
+      const c = polyCentroid(f)
+      const d = Math.hypot(c.x - x, c.y - y)
+      if (d < bd) { bd = d; best = i }
+    })
+    if (best >= 0) { out[newKeys[best]] = sk.faces[k]; used.add(best) }
+  }
+  sk.faces = out
+}
+
+/** 面の入れ子: parent[i] = i を直接含む面の index(なければ -1) */
+export function faceNesting(faces: Pt[][]): number[] {
+  const areas = faces.map(f => Math.abs(polyArea(f)))
+  return faces.map((f, i) => {
+    let parent = -1
+    let pArea = Infinity
+    for (let j = 0; j < faces.length; j++) {
+      if (i === j || areas[j] <= areas[i]) continue
+      if (polyContains(faces[j], f) && areas[j] < pArea) { parent = j; pArea = areas[j] }
+    }
+    return parent
+  })
+}
+
+// 面検出のキャッシュ(スケッチ描画のたびに再計算しない)
+const faceCache = new WeakMap<object, { sig: string; faces: Pt[][] }>()
+export function sketchFaces(sk: { edges: { a: Pt; b: Pt }[]; faces?: Record<string, FaceInfo> }): Pt[][] {
+  const sig = JSON.stringify(sk.edges)
+  const hit = faceCache.get(sk)
+  if (hit && hit.sig === sig) return hit.faces
+  const faces = computeFaces(sk.edges)
+  reconcileFaces(sk, faces) // 面情報(押し出し高さ等)を新しい面キーへ引き継ぐ
+  faceCache.set(sk, { sig, faces })
+  return faces
+}
+
 /** ラベルの置き場所: outer の内側かつ holes の外側で、境界から最も離れた点 */
 export function labelAnchor(outer: Pt[], holes: Pt[][]): Pt {
   const inside = (p: Pt): boolean => pointInPoly(p, outer) && !holes.some(h => pointInPoly(p, h))

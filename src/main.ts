@@ -5,7 +5,8 @@ import {
   OpeningKind, StairKind, FurnKind, EquipKind, PlantKind, RoomUse, isWindow, MATERIALS
 } from './model'
 import { Renderer2D } from './renderer2d'
-import { ToolManager, ToolName, params } from './tools'
+import { ToolManager, ToolName, params, SNAP_KINDS } from './tools'
+import * as geomApi from './geometry'
 import { runLegalCheck } from './legal'
 import {
   download, pickFile, exportDXF, importDXF,
@@ -33,7 +34,8 @@ const TOOL_DEFS: { name: ToolName; label: string; kbd: string; icon: string }[] 
   { name: 'planting', label: '植栽/人', kbd: 'P', icon: '<circle cx="12" cy="10" r="6"/><path d="M12 16 v5"/>' },
   { name: 'dimension', label: '寸法', kbd: 'M', icon: '<path d="M4 8 v8 M20 8 v8 M4 12 h16 M6 10 l-2 2 2 2 M18 10 l2 2 -2 2"/>' },
   { name: 'label', label: '文字', kbd: 'T', icon: '<path d="M6 6 h12 M12 6 v13"/>' },
-  { name: 'room', label: '部屋', kbd: 'A', icon: '<path d="M4 4 h16 v16 h-16 z" stroke-dasharray="3 2.4"/>' }
+  { name: 'room', label: '部屋', kbd: 'A', icon: '<path d="M4 4 h16 v16 h-16 z" stroke-dasharray="3 2.4"/>' },
+  { name: 'pencil', label: '鉛筆', kbd: 'L', icon: '<path d="M4 20 l1-4 L16 5 a1.6 1.6 0 0 1 2.3 0 l0.7 0.7 a1.6 1.6 0 0 1 0 2.3 L8 19 z"/><path d="M14.5 6.5 l3 3"/>' }
 ]
 
 const palette = $('#tool-palette')
@@ -103,8 +105,25 @@ function renderToolOptions(): void {
   toolOptions.innerHTML = ''
   const t = tm.tool
   if (t === 'wall') {
+    // 厚さ = 基準線(通り芯)から右側 + 左側。ロックで左右対称に連動
+    const syncThickness = (): void => { params.wall.thickness = params.wall.offR + params.wall.offL; renderToolOptions() }
     toolOptions.append(
-      field('厚さ mm', numInput(params.wall.thickness, v => { params.wall.thickness = v })),
+      field('厚さ mm', numInput(params.wall.thickness, v => {
+        params.wall.thickness = v
+        params.wall.offR = v / 2; params.wall.offL = v / 2
+        renderToolOptions()
+      })),
+      field('基準線→右 mm', numInput(params.wall.offR, v => {
+        params.wall.offR = Math.max(0, v)
+        if (params.wall.lock) params.wall.offL = params.wall.offR
+        syncThickness()
+      })),
+      field('基準線→左 mm', numInput(params.wall.offL, v => {
+        params.wall.offL = Math.max(0, v)
+        if (params.wall.lock) params.wall.offR = params.wall.offL
+        syncThickness()
+      })),
+      checkbox('右/左を連動(ロック)', params.wall.lock, v => { params.wall.lock = v }),
       field('高さ mm', numInput(params.wall.height, v => { params.wall.height = v })),
       checkbox('構造壁(塗り)', params.wall.structural, v => { params.wall.structural = v }),
       checkbox('円弧壁(3点指定)', params.wall.arc, v => { params.wall.arc = v })
@@ -155,7 +174,25 @@ function renderToolOptions(): void {
       field('高さ mm', numInput(params.planting.height, v => { params.planting.height = v }))
     )
   } else if (t === 'room') {
-    toolOptions.append(field('用途', select(ROOM_USES.map(u => [u, u]), params.room.use, v => { params.room.use = v })))
+    toolOptions.append(
+      field('入力モード', select([['rect', '長方形(2点)'], ['poly', '鉛筆(多角形)']], params.room.mode, v => { params.room.mode = v; tm.setTool('room') })),
+      field('用途', select(ROOM_USES.map(u => [u, u]), params.room.use, v => { params.room.use = v }))
+    )
+  } else if (t === 'pencil') {
+    toolOptions.append(
+      field('入力モード', select([['poly', '鉛筆(線)'], ['rect', '長方形(2点)']], params.pencil.mode, v => { params.pencil.mode = v; tm.setTool('pencil') }))
+    )
+    const colorBtn = document.createElement('button')
+    colorBtn.className = 'color-swatch-btn'
+    const sq = document.createElement('span')
+    sq.className = 'color-swatch'
+    if (params.pencil.color) sq.style.background = params.pencil.color
+    else sq.classList.add('none')
+    const lbl = document.createElement('span')
+    lbl.textContent = params.pencil.color ?? '既定(黒)'
+    colorBtn.append(sq, lbl)
+    colorBtn.onclick = () => openColorPop(colorBtn, params.pencil.color, c => { params.pencil.color = c; renderToolOptions() })
+    toolOptions.append(field('辺の色', colorBtn))
   } else if (t === 'label') {
     toolOptions.append(field('文字高 mm', numInput(params.label.size, v => { params.label.size = v })))
   } else {
@@ -453,6 +490,57 @@ function renderProperties(): void {
       title.textContent = '寸法'
       propsEl.append(field('オフセット', numInput(e.offset, v => upd(() => { e.offset = v }))))
       break
+    case 'sketch': {
+      const sub = tm.sketchSub?.id === e.id ? tm.sketchSub : null
+      title.textContent = sub?.mode === 'edge' ? 'スケッチ: 辺'
+        : sub?.mode === 'face' ? 'スケッチ: 面'
+        : sub?.mode === 'loop' ? 'スケッチ: 閉路'
+        : `スケッチ(辺 ${e.edges.length} 本)`
+      if (sub?.mode === 'edge' && sub.edgeIdx !== undefined && e.edges[sub.edgeIdx]) {
+        // 選択中の辺の色
+        const ed = e.edges[sub.edgeIdx]
+        propsEl.append(colorField(ed, upd))
+      } else if ((sub?.mode === 'face' || sub?.mode === 'loop') && sub.faceIdx !== undefined) {
+        // 選択中の面: 押し出し高さ + 削除
+        const { sketchFaces, faceInfo } = geomApi
+        const faces = sketchFaces(e)
+        const f = faces[sub.faceIdx]
+        if (f) {
+          const info = faceInfo(e, f)
+          propsEl.append(field('押し出し高さ mm', numInput(info.h ?? 0, v => upd(() => {
+            tm.setFaceHeight(e.id, f, Math.max(0, v))
+          }), 50, 0)))
+          const eraseBtn = document.createElement('button')
+          eraseBtn.textContent = 'この面を削除(貫通穴)'
+          eraseBtn.className = 'danger'
+          eraseBtn.onclick = () => { tm.eraseSelectedFace(); renderProperties() }
+          propsEl.append(eraseBtn)
+        }
+      } else {
+        // 全体: 全ての辺の色を一括変更
+        const proxy = { color: e.edges[0]?.color }
+        propsEl.append(field('辺の色(一括)', (() => {
+          const btn = document.createElement('button')
+          btn.className = 'color-swatch-btn'
+          const sq = document.createElement('span')
+          sq.className = 'color-swatch'
+          if (proxy.color) sq.style.background = proxy.color
+          else sq.classList.add('none')
+          const lbl = document.createElement('span')
+          lbl.textContent = proxy.color ?? 'なし'
+          btn.append(sq, lbl)
+          btn.onclick = () => openColorPop(btn, proxy.color, c => upd(() => {
+            for (const ed of e.edges) ed.color = c
+          }))
+          return btn
+        })()))
+        const hint = document.createElement('div')
+        hint.className = 'empty'
+        hint.textContent = '再クリックで 面 → 閉路 → 辺 と選択を絞り込めます'
+        propsEl.append(hint)
+      }
+      break
+    }
     case 'custom':
       title.textContent = `部品: ${e.label || '(無題)'}`
       propsEl.append(
@@ -479,15 +567,21 @@ function addDeleteButton(): void {
   }
   const dup = document.createElement('button')
   dup.textContent = '複製'
-  dup.onclick = () => {
-    const def = makeComponent('_tmp', store, renderer.selection)
-    tm.placeComponent(def)
-    setMsg('クリックで複製を配置')
-  }
+  dup.onclick = () => beginDup()
   row.append(dup, del)
   propsEl.appendChild(row)
 }
-tm.onSelectionChange = () => renderProperties()
+/** 基準点複写: 基準点をクリック → その点を掴んだ状態でガイド付き配置 */
+function beginDup(): void {
+  if (!renderer.selection.size) return
+  tm.beginDuplicate()
+  setMsg('コピーの基準点をクリック → 配置先をクリック(距離・延長・対角ガイド付き)')
+}
+tm.onDupBase = base => {
+  const def = makeComponent('_tmp', store, renderer.selection, base)
+  tm.placeComponent(def)
+}
+tm.onSelectionChange = () => { renderProperties(); renderObjectList() }
 // 部屋・文字のダブルクリックで名前(内容)を直接編集
 tm.onRename = ent => {
   if (ent.type === 'room') {
@@ -510,6 +604,16 @@ function renderProjectSettings(): void {
     field('建蔽率 %', numInput(m.bcrLimit, v => { m.bcrLimit = v }, 1, 0, 100)),
     field('容積率 %', numInput(m.farLimit, v => { m.farLimit = v }, 1, 0, 2000))
   )
+  // 各階の階高(床から次の床まで)。0 = 自動(最大壁高 + スラブ厚)
+  for (const l of store.doc.levels) {
+    const inp = numInput(l.height ?? 0, v => {
+      store.commit()
+      l.height = v > 0 ? v : undefined
+      store.emit()
+    }, 50, 0)
+    inp.placeholder = '自動'
+    el.append(field(`${l.name} 階高 mm`, inp))
+  }
   // 階数は階タブ(1F/2F/…)で管理するため入力欄は持たない
 }
 
@@ -519,6 +623,7 @@ function renderFloors(): void {
   const sig = store.doc.levels.map(l => l.id + l.name).join('|') + '@' + store.active
   if (sig === floorSig) return
   floorSig = sig
+  renderProjectSettings() // 階の増減に合わせて階高入力欄も更新
   const tabs = $('#floor-tabs')
   tabs.innerHTML = ''
   store.doc.levels.forEach((l, i) => {
@@ -631,19 +736,24 @@ objActions.querySelector('[data-act="rotate"]')!.addEventListener('click', () =>
     tm.rotateSelection()
   }
 })
-objActions.querySelector('[data-act="dup"]')!.addEventListener('click', () => {
-  if (!renderer.selection.size) return
-  const def = makeComponent('_tmp', store, renderer.selection)
-  tm.placeComponent(def)
-  setMsg('クリックで複製を配置')
+objActions.querySelector('[data-act="dup"]')!.addEventListener('click', () => beginDup())
+// 消しゴム: スケッチの面を選択しているときだけ表示
+const eraseBtn = objActions.querySelector('[data-act="erase"]') as HTMLButtonElement
+eraseBtn.addEventListener('click', () => {
+  tm.eraseSelectedFace()
+  renderProperties()
+  setMsg('面を削除しました(内側の面なら貫通穴になります)')
 })
+tm.onSketchSub = sub => {
+  eraseBtn.hidden = !(sub && (sub.mode === 'face' || sub.mode === 'loop') && sub.faceIdx !== undefined)
+  renderProperties()
+}
 objActions.querySelector('[data-act="del"]')!.addEventListener('click', () => {
   store.commit(); store.remove(renderer.selection)
   renderer.selection.clear(); renderProperties(); renderer.requestDraw()
 })
-// グループ化 / 解除(複数選択時に表示)
-const groupBtn = objActions.querySelector('[data-act="group"]') as HTMLButtonElement
-groupBtn.addEventListener('click', () => {
+// グループ化 / 解除(複数選択時に表示。オブジェクト一覧からも使う)
+function toggleGroup(): void {
   const ents = [...renderer.selection].map(id => store.byId(id)).filter((e): e is Entity => !!e)
   if (ents.length < 2 && !ents.some(e => e.group)) return
   store.commit()
@@ -657,7 +767,82 @@ groupBtn.addEventListener('click', () => {
     setMsg(`${ents.length} 個の要素をグループ化しました(クリックでまとめて選択されます)`)
   }
   store.emit()
-})
+}
+const groupBtn = objActions.querySelector('[data-act="group"]') as HTMLButtonElement
+groupBtn.addEventListener('click', toggleGroup)
+
+// ================= オブジェクト一覧(表示 / 非表示・グループ化) =================
+const objListEl = $('#object-list')
+const objListGroupBtn = $('#objlist-group') as HTMLButtonElement
+objListGroupBtn.onclick = toggleGroup
+function entLabel(e: Entity): string {
+  switch (e.type) {
+    case 'wall': return `壁 (${Math.round(Math.hypot(e.b.x - e.a.x, e.b.y - e.a.y))}mm)`
+    case 'opening': return OPENING_LABEL[e.kind]
+    case 'stair': return STAIR_LABEL[e.kind]
+    case 'furniture': return FURN_DEFAULTS[e.kind]?.label ?? '家具'
+    case 'equipment': return EQUIP_LABEL[e.kind]
+    case 'column': return e.shape === 'round' ? '丸柱' : '角柱'
+    case 'planting': return PLANT_LABEL[e.kind]
+    case 'dimension': return '寸法'
+    case 'label': return `文字「${e.text.slice(0, 8)}」`
+    case 'room': return `部屋: ${e.name}`
+    case 'custom': return `部品: ${e.label || '(無題)'}`
+    case 'sketch': return `スケッチ(${e.edges.length}辺)`
+  }
+}
+let objListSig = ''
+function renderObjectList(): void {
+  const ents = store.doc.entities
+  const sig = ents.map(e => `${e.id}${e.hidden ? 'h' : ''}${e.group ?? ''}${renderer.selection.has(e.id) ? 's' : ''}${entLabel(e)}`).join('|')
+  if (sig === objListSig) return
+  objListSig = sig
+  objListEl.innerHTML = ''
+  objListGroupBtn.hidden = renderer.selection.size < 2
+  if (!ents.length) {
+    objListEl.innerHTML = '<div class="empty">要素がありません</div>'
+    return
+  }
+  for (const e of ents) {
+    const row = document.createElement('div')
+    row.className = 'comp-item obj-row' + (renderer.selection.has(e.id) ? ' active' : '')
+    // 表示 / 非表示(目のアイコン)
+    const eye = document.createElement('button')
+    eye.className = 'obj-eye' + (e.hidden ? ' off' : '')
+    eye.title = e.hidden ? '表示する' : '非表示にする'
+    eye.innerHTML = e.hidden
+      ? '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 3l18 18M10.5 5.2A9.8 9.8 0 0 1 12 5c5 0 9 4.5 10 7-.4 1-1.3 2.4-2.6 3.7M6.6 6.6C4.1 8.1 2.5 10.5 2 12c1 2.5 5 7 10 7 1.6 0 3.1-.5 4.4-1.2"/></svg>'
+      : '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M2 12c1-2.5 5-7 10-7s9 4.5 10 7c-1 2.5-5 7-10 7S3 14.5 2 12z"/><circle cx="12" cy="12" r="3"/></svg>'
+    eye.onclick = ev => {
+      ev.stopPropagation()
+      store.commit()
+      e.hidden = !e.hidden || undefined
+      if (e.hidden) { renderer.selection.delete(e.id) }
+      store.emit()
+      tm.onSelectionChange()
+    }
+    const name = document.createElement('span')
+    name.className = 'name'
+    name.textContent = (e.group ? '⛓ ' : '') + entLabel(e)
+    if (e.hidden) name.style.opacity = '0.45'
+    row.append(eye, name)
+    row.onclick = ev => {
+      if (ev.shiftKey) {
+        if (renderer.selection.has(e.id)) renderer.selection.delete(e.id)
+        else renderer.selection.add(e.id)
+      } else {
+        renderer.selection.clear()
+        renderer.selection.add(e.id)
+        store.expandGroups(renderer.selection)
+      }
+      tm.onSelectionChange()
+      renderer.requestDraw()
+      if (!$('#view3d').hidden) view3d?.highlightSelection()
+    }
+    objListEl.appendChild(row)
+  }
+}
+store.onChange(() => renderObjectList())
 function updateObjActions(): void {
   const ids = [...renderer.selection]
   if (!ids.length) { objActions.hidden = true; return }
@@ -1128,8 +1313,9 @@ async function ensure3D(): Promise<View3D> {
     view3d.magnetize = id => tm.magnetizeById(id)
     view3d.onRendered = () => { if (!$('#view3d').hidden) updateObjActions() }
     view3d.getWallStart = () => tm.wallStartPt
-    view3d.getRoomPts = () => tm.roomPoints
+    view3d.getRoomPts = () => (tm.tool === 'pencil' ? tm.pencilPoints : tm.roomPoints)
     view3d.getDimPts = () => tm.dimPoints
+    view3d.getGrid = () => renderer.gridStep
     view3d.getPreviewEntity = p => {
       const t = tm.tool
       switch (t) {
@@ -1171,7 +1357,7 @@ async function ensure3D(): Promise<View3D> {
       if (t === 'equipment') return { kind: 'box', w: 500, d: 300, h: 900, rot: tm.placeRot }
       if (t === 'planting') return { kind: 'box', w: 600, d: 600, h: params.planting.height, rot: 0 }
       if (t === 'label' || t === 'component') return { kind: 'box', w: 400, d: 400, h: 200, rot: tm.placeRot }
-      if (t === 'room' || t === 'dimension') return { kind: 'poly', w: 0, d: 0, h: 0, rot: 0 }
+      if (t === 'room' || t === 'dimension' || t === 'pencil') return { kind: 'poly', w: 0, d: 0, h: 0, rot: 0 }
       return null
     }
     view3d.onEdited = () => { store.emit() }
@@ -1196,11 +1382,16 @@ store.onChange(() => {
     if (!$('#view3d').hidden && view3d) view3d.rebuild(store)
   })
 })
-$('#tab-2d').onclick = () => switchTab('2d')
-$('#tab-3d').onclick = () => void switchTab('3d')
+// ================= 視点プルダウン(2D: 平面図 / 3D: 立面・アイソメ) =================
+const viewSelect = $('#view-select') as HTMLSelectElement
+viewSelect.onchange = () => void applyViewPreset(viewSelect.value)
+async function applyViewPreset(v: string): Promise<void> {
+  if (v === 'plan') { await switchTab('2d'); return }
+  await switchTab('3d')
+  view3d?.setView(v as import('./view3d').ViewPreset)
+}
 async function switchTab(t: '2d' | '3d'): Promise<void> {
-  $('#tab-2d').classList.toggle('active', t === '2d')
-  $('#tab-3d').classList.toggle('active', t === '3d')
+  if (t === '2d') viewSelect.value = 'plan'
   const v3 = $('#view3d')
   $('#scale-bar').style.display = t === '3d' ? 'none' : ''
   if (t === '3d') {
@@ -1279,6 +1470,44 @@ tm.onZoom = z => {
   renderer.showWallT = (e.target as HTMLInputElement).checked
   renderer.requestDraw()
 }
+// スナップガイド(端点・中点・延長など)の有効 / 無効
+Object.assign(tm.snapEnabled, loadJson<Record<string, boolean>>('oarc.snapen', {}))
+let guidePop: HTMLDivElement | null = null
+$('#st-guides').onclick = () => {
+  if (guidePop) { guidePop.remove(); guidePop = null; return }
+  const pop = document.createElement('div')
+  guidePop = pop
+  pop.className = 'comp-menu guide-pop'
+  const title = document.createElement('div')
+  title.className = 'cp-title'
+  title.textContent = 'スナップガイド'
+  pop.appendChild(title)
+  for (const k of SNAP_KINDS) {
+    const lab = document.createElement('label')
+    const cb = document.createElement('input')
+    cb.type = 'checkbox'
+    cb.checked = tm.snapEnabled[k] !== false
+    cb.onchange = () => {
+      tm.snapEnabled[k] = cb.checked
+      localStorage.setItem('oarc.snapen', JSON.stringify(tm.snapEnabled))
+    }
+    lab.append(cb, document.createTextNode(` ${k}`))
+    pop.appendChild(lab)
+  }
+  document.body.appendChild(pop)
+  const r = $('#st-guides').getBoundingClientRect()
+  pop.style.left = `${Math.max(8, r.left)}px`
+  pop.style.top = `${r.top - pop.offsetHeight - 6}px`
+  setTimeout(() => {
+    const onDoc = (ev: MouseEvent): void => {
+      if (!pop.contains(ev.target as Node) && ev.target !== $('#st-guides')) {
+        pop.remove(); guidePop = null
+        document.removeEventListener('pointerdown', onDoc)
+      }
+    }
+    document.addEventListener('pointerdown', onDoc)
+  })
+}
 tm.setHint = s => { $('#hint-bar').textContent = s }
 
 // ================= キーボード =================
@@ -1287,7 +1516,8 @@ window.addEventListener('keydown', e => {
   if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
   if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
     e.preventDefault()
-    if (e.shiftKey) store.redo(); else store.undo()
+    if (e.shiftKey) store.redo()
+    else if (!tm.undoDraft()) store.undo() // 作図中はまず「今引いている線」を取り消す
     renderProperties()
     return
   }
@@ -1355,6 +1585,26 @@ document.querySelectorAll('#view3d-toolbar [data-view]').forEach(b => {
   const v = await ensure3D()
   v.showUpper = (e.target as HTMLInputElement).checked
   v.applyFloorVisibility()
+}
+;($('#chk3d-lower') as HTMLInputElement).onchange = async e => {
+  const v = await ensure3D()
+  v.showLower = (e.target as HTMLInputElement).checked
+  v.applyFloorVisibility()
+}
+;($('#chk3d-wire') as HTMLInputElement).onchange = async e => {
+  const v = await ensure3D()
+  v.setWireframe((e.target as HTMLInputElement).checked)
+}
+const sectionRange = $('#rng3d-section') as HTMLInputElement
+;($('#chk3d-section') as HTMLInputElement).onchange = async e => {
+  const on = (e.target as HTMLInputElement).checked
+  sectionRange.hidden = !on
+  const v = await ensure3D()
+  v.setSection(on, parseInt(sectionRange.value, 10) / 100)
+}
+sectionRange.oninput = async () => {
+  const v = await ensure3D()
+  v.setSection(true, parseInt(sectionRange.value, 10) / 100)
 }
 ;($('#chk3d-axes') as HTMLInputElement).onchange = async e => {
   const v = await ensure3D()

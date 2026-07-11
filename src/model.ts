@@ -49,10 +49,15 @@ export const MATERIALS: MaterialDef[] = [
   { id: 'glass', label: 'ガラス', color: '#9cc3e8', opacity: 0.45 }
 ]
 
-export interface Wall { id: string; type: 'wall'; a: Pt; b: Pt; thickness: number; height: number; structural: boolean; material?: string; color?: string; group?: string }
+export interface Wall {
+  id: string; type: 'wall'; a: Pt; b: Pt; thickness: number; height: number; structural: boolean
+  material?: string; color?: string; group?: string; hidden?: boolean
+  /** 基準線(通り芯)の壁中心線からのオフセット(法線方向 mm)。未設定=中心 */
+  refOff?: number
+}
 export interface Opening {
   id: string; type: 'opening'; wallId: string; t: number; width: number
-  kind: OpeningKind; flip: boolean; swap: boolean; group?: string
+  kind: OpeningKind; flip: boolean; swap: boolean; group?: string; hidden?: boolean
   sill: number   // 床からの高さ(窓台)
   head: number   // 開口上端高さ
 }
@@ -60,20 +65,29 @@ export interface Opening {
 export interface WallAttach { wallId: string; side: 1 | -1 }
 export interface Stair {
   id: string; type: 'stair'; pos: Pt; rot: number; kind: StairKind
-  width: number; treads: number; tread: number; riser: number; material?: string; color?: string; group?: string; attach?: WallAttach
+  width: number; treads: number; tread: number; riser: number; material?: string; color?: string; group?: string; hidden?: boolean; attach?: WallAttach
 }
-export interface Furniture { id: string; type: 'furniture'; pos: Pt; rot: number; kind: FurnKind; w: number; d: number; h: number; material?: string; color?: string; group?: string; elev?: number; tiltX?: number; tiltZ?: number; attach?: WallAttach }
-export interface Equipment { id: string; type: 'equipment'; pos: Pt; rot: number; kind: EquipKind; group?: string; attach?: WallAttach }
-export interface Column { id: string; type: 'column'; pos: Pt; rot: number; w: number; d: number; h: number; shape: 'rect' | 'round'; material?: string; color?: string; group?: string; attach?: WallAttach }
+export interface Furniture { id: string; type: 'furniture'; pos: Pt; rot: number; kind: FurnKind; w: number; d: number; h: number; material?: string; color?: string; group?: string; hidden?: boolean; elev?: number; tiltX?: number; tiltZ?: number; attach?: WallAttach }
+export interface Equipment { id: string; type: 'equipment'; pos: Pt; rot: number; kind: EquipKind; group?: string; hidden?: boolean; attach?: WallAttach }
+export interface Column { id: string; type: 'column'; pos: Pt; rot: number; w: number; d: number; h: number; shape: 'rect' | 'round'; material?: string; color?: string; group?: string; hidden?: boolean; attach?: WallAttach }
 /** 寸法線の端点が従属しているスナップ点(壁の t 位置・部屋の頂点など)。対象が変形するとリアルタイム追従 */
 export interface DimAnchor { entId: string; t?: number; vi?: number; kind: 'wall' | 'roomV' | 'roomC' | 'center' }
 export interface DimensionE {
-  id: string; type: 'dimension'; a: Pt; b: Pt; offset: number; group?: string
+  id: string; type: 'dimension'; a: Pt; b: Pt; offset: number; group?: string; hidden?: boolean
   anchorA?: DimAnchor; anchorB?: DimAnchor
 }
-export interface LabelE { id: string; type: 'label'; pos: Pt; text: string; size: number; group?: string }
-export interface Room { id: string; type: 'room'; poly: Pt[]; name: string; use: RoomUse; showArea: boolean; material?: string; color?: string; group?: string }
-export interface Planting { id: string; type: 'planting'; pos: Pt; kind: PlantKind; height: number; group?: string }
+export interface LabelE { id: string; type: 'label'; pos: Pt; text: string; size: number; group?: string; hidden?: boolean }
+export interface Room { id: string; type: 'room'; poly: Pt[]; name: string; use: RoomUse; showArea: boolean; material?: string; color?: string; group?: string; hidden?: boolean }
+export interface Planting { id: string; type: 'planting'; pos: Pt; kind: PlantKind; height: number; group?: string; hidden?: boolean }
+/** 鉛筆ツールの線1本。色は辺ごとに設定可能 */
+export interface SketchEdge { a: Pt; b: Pt; color?: string }
+/** 鉛筆ツールで描いたスケッチ(SketchUp 流)。閉路は自動的に面になる。
+ *  faces のキーは面の図心(faceKey)。h=押し出し高さ mm / dead=面を削除(貫通穴) */
+export interface SketchE {
+  id: string; type: 'sketch'; edges: SketchEdge[]
+  faces?: Record<string, { h?: number; dead?: boolean }>
+  group?: string; hidden?: boolean
+}
 /** 部品スタジオ(CSG モデリング)で作成したオリジナル部品 */
 export interface CustomE {
   id: string; type: 'custom'; pos: Pt; rot: number
@@ -82,6 +96,7 @@ export interface CustomE {
   label: string
   symbol: 'rect' | 'round'              // 2D 図面での表示記号
   color?: string; group?: string; elev?: number
+  hidden?: boolean
   /** 三角形メッシュの頂点(mm、原点=底面中央) */
   positions: number[]
   /** 部品スタジオでの再編集用レシピ(プリミティブ構成) */
@@ -92,7 +107,7 @@ export interface CustomE {
   attach?: WallAttach
 }
 
-export type Entity = Wall | Opening | Stair | Furniture | Equipment | Column | DimensionE | LabelE | Room | Planting | CustomE
+export type Entity = Wall | Opening | Stair | Furniture | Equipment | Column | DimensionE | LabelE | Room | Planting | CustomE | SketchE
 
 export interface ProjectMeta {
   title: string
@@ -102,8 +117,8 @@ export interface ProjectMeta {
   floors: number
 }
 
-/** 階(フロア)。図面は階ごとに独立して持つ */
-export interface Level { id: string; name: string; entities: Entity[] }
+/** 階(フロア)。図面は階ごとに独立して持つ。height=階高 mm(未設定は壁高から自動) */
+export interface Level { id: string; name: string; entities: Entity[]; height?: number }
 
 export interface Doc {
   version: number
