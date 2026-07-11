@@ -1,7 +1,7 @@
 // ツール(作図・選択)とポインタ操作
 import {
   Store, Entity, Wall, Opening, SketchE, uid, OpeningKind, StairKind, FurnKind, EquipKind, PlantKind,
-  FURN_DEFAULTS, isWindow, Room, RoomUse, DimAnchor
+  FURN_DEFAULTS, isWindow, Room, RoomUse, DimAnchor, equipSize
 } from './model'
 import { Renderer2D } from './renderer2d'
 import {
@@ -108,6 +108,12 @@ export class ToolManager {
   get roomPoints(): Pt[] { return this.roomPts }
   get dimPoints(): Pt[] { return this.dimPts }
   get pencilPoints(): Pt[] { return this.penPts }
+  get rectStartPt(): Pt | null { return this.rectStart }
+  /** 3D ビューなど外部から使うスナップ(結果の点 + 種別 + ガイド線) */
+  snapInfo(p: Pt): { p: Pt; kind: string | null; guides: { a: Pt; b: Pt }[] } {
+    const sp = this.snapPoint(p)
+    return { p: sp, kind: this.snapKind, guides: [...this.snapGuides] }
+  }
   private panning = false
   private panStart: Pt = pt(0, 0)
   private panView: Pt = pt(0, 0)
@@ -121,7 +127,14 @@ export class ToolManager {
     canvas.addEventListener('dblclick', () => this.dblclick())
     canvas.addEventListener('contextmenu', e => {
       e.preventDefault()
-      if (!this.panMoved) this.cancel() // 右ドラッグでパンした時はキャンセルしない
+      if (this.panMoved) return // 右ドラッグでパンした時はキャンセルしない
+      // 複写(基準点待ち・配置中)の右クリックはキャンセルして選択ツールへ
+      if (this.dupAwaitBase || this.tool === 'component') {
+        this.cancel()
+        this.setTool('select')
+        return
+      }
+      this.cancel()
     })
     r.overlay = (ctx, zoom) => this.drawOverlay(ctx, zoom)
     store.onChange(() => {
@@ -506,6 +519,7 @@ export class ToolManager {
       return
     }
     if (e.button !== 0) return
+    if (this.r.elevation) return // 立面図は閲覧専用(パン・ズームのみ)
     // カーソル上のモード切替アイコン(鉛筆 / 長方形)のクリック
     if ((this.tool === 'room' || this.tool === 'pencil') && !this.rectStart && !this.penPts.length && !this.roomPts.length) {
       for (const ic of this.modeIcons) {
@@ -521,11 +535,7 @@ export class ToolManager {
     }
     // 基準点複写: 最初のクリック = コピーの基準点
     if (this.dupAwaitBase) {
-      const base = this.snapPoint(p)
-      this.dupAwaitBase = false
-      this.dupFrom = base
-      this.canvas.style.cursor = ''
-      this.onDupBase(base)
+      this.pickDupBase(p)
       return
     }
     const sp = this.snapPoint(p)
@@ -852,6 +862,14 @@ export class ToolManager {
   /** 基準点が決まったとき(main 側でコンポーネント化して配置モードへ) */
   onDupBase: (base: Pt) => void = () => {}
   get dupBase(): Pt | null { return this.dupFrom }
+  /** 基準点の確定(2D クリック / 3D クリック共通) */
+  pickDupBase(p: Pt): void {
+    const base = this.snapPoint(p)
+    this.dupAwaitBase = false
+    this.dupFrom = base
+    this.canvas.style.cursor = ''
+    this.onDupBase(base)
+  }
 
   /** 数値入力バッファ(部屋・鉛筆の寸法指定)を確定 */
   private applyNumBuf(): void {
@@ -1016,8 +1034,9 @@ export class ToolManager {
         add(ent.pos, rotate(pt((sx * ent.w) / 2, (sy * ent.d) / 2), ent.rot))))
     }
     if (ent.type === 'equipment') {
+      const s = equipSize(ent)
       return [-1, 1].flatMap(sx => [-1, 1].map(sy =>
-        add(ent.pos, rotate(pt(sx * 250, sy * 150), ent.rot))))
+        add(ent.pos, rotate(pt((sx * s.w) / 2, (sy * s.d) / 2), ent.rot))))
     }
     if (ent.type === 'stair') {
       // ローカル外形(pos は角基準)
@@ -1120,8 +1139,9 @@ export class ToolManager {
    * 現在のツールでワールド座標 p に配置する(2D クリック / 3D クリック共通)。
    * wallIdHint は 3D で壁を直接クリックした場合の建具配置先。
    */
-  placeAt(p: Pt, opts: { shift?: boolean; wallId?: string } = {}): void {
-    const sp = this.snapPoint(p)
+  placeAt(p: Pt, opts: { shift?: boolean; wallId?: string; noSnap?: boolean } = {}): void {
+    // noSnap: 3D 側で既にスナップ・軸ロック済みの点(再スナップでずれないように)
+    const sp = opts.noSnap ? p : this.snapPoint(p)
     switch (this.tool) {
       case 'wall': {
         const q = opts.shift && this.wallStart ? this.ortho(this.wallStart, sp) : sp
@@ -1491,8 +1511,32 @@ export class ToolManager {
         }
         return out
       }
-      case 'equipment':
-        return [rotHandle(ent, 300 + 20 / this.r.vp.zoom)]
+      case 'equipment': {
+        // 家具と同様に 4 隅でリサイズできる
+        const s = equipSize(ent)
+        const out: { key: string; pos: Pt; raw?: boolean; shape?: 'circle'; apply: (q: Pt) => void }[] = [
+          rotHandle(ent, s.d / 2 + 24 / this.r.vp.zoom)
+        ]
+        for (const sx of [-1, 1]) {
+          for (const sy of [-1, 1]) {
+            out.push({
+              key: `c${sx}${sy}`,
+              pos: add(ent.pos, rotate(pt((sx * s.w) / 2, (sy * s.d) / 2), ent.rot)),
+              apply: (q: Pt) => {
+                const cur = equipSize(ent)
+                const l = rotate(sub(q, ent.pos), -ent.rot)
+                const ax = (-sx * cur.w) / 2, ay = (-sy * cur.d) / 2
+                const w = Math.max(100, Math.abs(l.x - ax))
+                const d = Math.max(80, Math.abs(l.y - ay))
+                const cLocal = pt((l.x + ax) / 2, (l.y + ay) / 2)
+                ent.pos = add(ent.pos, rotate(cLocal, ent.rot))
+                ent.w = w; ent.d = d
+              }
+            })
+          }
+        }
+        return out
+      }
       case 'stair': {
         if (ent.kind === 'spiral') {
           return [{
@@ -1658,6 +1702,7 @@ export class ToolManager {
 
   // ---------- プレビュー描画 ----------
   private drawOverlay(ctx: CanvasRenderingContext2D, zoom: number): void {
+    if (this.r.elevation) return // 立面図は閲覧専用
     const c = this.cursor
     ctx.strokeStyle = '#2563eb'
     ctx.fillStyle = '#2563eb'
@@ -1673,6 +1718,26 @@ export class ToolManager {
       ctx.strokeRect(start.x, start.y, cur.x - start.x, cur.y - start.y)
       ctx.restore()
       return
+    }
+    // 基準点複写: 基準点の選択待ち(十字カーソル + ラベルで明確化)
+    if (this.dupAwaitBase) {
+      ctx.save()
+      ctx.strokeStyle = '#2563eb'; ctx.fillStyle = '#2563eb'
+      ctx.lineWidth = 1.2 / zoom
+      const s = 14 / zoom
+      ctx.beginPath()
+      ctx.moveTo(c.x - s, c.y); ctx.lineTo(c.x + s, c.y)
+      ctx.moveTo(c.x, c.y - s); ctx.lineTo(c.x, c.y + s)
+      ctx.stroke()
+      ctx.font = `${12 / zoom}px sans-serif`
+      const label = 'コピーの基準点をクリック(右クリックでキャンセル)'
+      const w = ctx.measureText(label).width + 14 / zoom
+      ctx.fillStyle = '#1d4ed8'
+      ctx.fillRect(c.x + 16 / zoom, c.y - 26 / zoom, w, 20 / zoom)
+      ctx.fillStyle = '#ffffff'
+      ctx.textAlign = 'left'; ctx.textBaseline = 'middle'
+      ctx.fillText(label, c.x + 23 / zoom, c.y - 16 / zoom)
+      ctx.restore()
     }
     // カーソル十字 + 端点スナップの表示(緑の○)
     if (this.tool !== 'select') {
@@ -1920,32 +1985,57 @@ export class ToolManager {
       ctx.restore()
     }
 
-    // 部屋・鉛筆ツール: カーソル上のモード切替アイコン(✎ 鉛筆 / ▭ 長方形)
+    // 部屋・鉛筆ツール: カーソル上のモードアイコン(現在のモードだけを青丸+白で表示。クリックで切替)
     this.modeIcons = []
     if (this.tool === 'room' || this.tool === 'pencil') {
-      const mode = (this.tool === 'room' ? params.room : params.pencil).mode
-      const R = 11 / zoom
-      const cy0 = c.y - 32 / zoom
-      const defs: { mode: DrawMode; cx: number; glyph: string }[] = [
-        { mode: 'poly', cx: c.x + 24 / zoom, glyph: '✎' },
-        { mode: 'rect', cx: c.x + 24 / zoom + 26 / zoom, glyph: '▭' }
-      ]
+      const pr = this.tool === 'room' ? params.room : params.pencil
+      const R = 15 / zoom
+      const cx0 = c.x + 30 / zoom
+      const cy0 = c.y - 34 / zoom
       ctx.save()
-      for (const dfn of defs) {
-        const active = dfn.mode === mode
-        ctx.beginPath(); ctx.arc(dfn.cx, cy0, R, 0, Math.PI * 2)
-        ctx.fillStyle = active ? '#2563eb' : 'rgba(255,255,255,0.92)'
-        ctx.fill()
-        ctx.strokeStyle = active ? '#1d4ed8' : '#9ca3af'
-        ctx.lineWidth = 1.2 / zoom
+      // 青い円 + 影
+      ctx.beginPath(); ctx.arc(cx0, cy0, R, 0, Math.PI * 2)
+      ctx.fillStyle = '#2563eb'
+      ctx.shadowColor = 'rgba(0,0,0,0.25)'
+      ctx.shadowBlur = 6 / zoom
+      ctx.shadowOffsetY = 1.5 / zoom
+      ctx.fill()
+      ctx.shadowColor = 'transparent'
+      ctx.strokeStyle = '#ffffff'
+      ctx.lineWidth = 1.6 / zoom
+      ctx.lineJoin = 'round'; ctx.lineCap = 'round'
+      const u = R / 15 // アイコン内のスケール単位
+      if (pr.mode === 'poly') {
+        // 鉛筆: 本体(平行四辺形)+ 先端の三角 + 消しゴム側のキャップ
+        ctx.beginPath()
+        ctx.moveTo(cx0 - 6.5 * u, cy0 + 6.5 * u)   // 先端
+        ctx.lineTo(cx0 - 4.2 * u, cy0 + 1.8 * u)   // 芯の付け根(下側)
+        ctx.lineTo(cx0 + 4.6 * u, cy0 - 7.0 * u)   // 上端(下側)
+        ctx.lineTo(cx0 + 7.0 * u, cy0 - 4.6 * u)   // 上端(上側)
+        ctx.lineTo(cx0 - 1.8 * u, cy0 + 4.2 * u)   // 芯の付け根(上側)
+        ctx.closePath()
         ctx.stroke()
-        ctx.fillStyle = active ? '#ffffff' : '#4b5563'
-        ctx.font = `${13 / zoom}px sans-serif`
-        ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
-        ctx.fillText(dfn.glyph, dfn.cx, cy0 + 0.5 / zoom)
-        this.modeIcons.push({ c: pt(dfn.cx, cy0), r: R * 1.25, mode: dfn.mode })
+        // 芯(先端の塗り)
+        ctx.beginPath()
+        ctx.moveTo(cx0 - 6.5 * u, cy0 + 6.5 * u)
+        ctx.lineTo(cx0 - 4.2 * u, cy0 + 1.8 * u)
+        ctx.lineTo(cx0 - 1.8 * u, cy0 + 4.2 * u)
+        ctx.closePath()
+        ctx.fillStyle = '#ffffff'
+        ctx.fill()
+        // 消しゴム側の区切り線
+        ctx.beginPath()
+        ctx.moveTo(cx0 + 3.2 * u, cy0 - 5.6 * u)
+        ctx.lineTo(cx0 + 5.6 * u, cy0 - 3.2 * u)
+        ctx.stroke()
+      } else {
+        // 長方形
+        ctx.strokeRect(cx0 - 6.5 * u, cy0 - 4.5 * u, 13 * u, 9 * u)
       }
       ctx.restore()
+      // クリックで反対のモードへ
+      const other: DrawMode = pr.mode === 'poly' ? 'rect' : 'poly'
+      this.modeIcons.push({ c: pt(cx0, cy0), r: R * 1.2, mode: other })
     }
   }
 }

@@ -2,7 +2,7 @@
 import './style.css'
 import {
   Store, newDoc, Entity, uid, OPENING_LABEL, STAIR_LABEL, FURN_DEFAULTS, EQUIP_LABEL, PLANT_LABEL,
-  OpeningKind, StairKind, FurnKind, EquipKind, PlantKind, RoomUse, isWindow, MATERIALS
+  OpeningKind, StairKind, FurnKind, EquipKind, PlantKind, RoomUse, isWindow, MATERIALS, equipSize
 } from './model'
 import { Renderer2D } from './renderer2d'
 import { ToolManager, ToolName, params, SNAP_KINDS } from './tools'
@@ -24,18 +24,17 @@ const tm = new ToolManager(store, renderer, canvas)
 // ================= ツールパレット =================
 const TOOL_DEFS: { name: ToolName; label: string; kbd: string; icon: string }[] = [
   { name: 'select', label: '選択', kbd: 'V', icon: '<path d="M6 3 L18 12 L12 13 L15 20 L12.5 21 L9.5 14 L6 17 Z"/>' },
+  { name: 'pencil', label: '鉛筆', kbd: 'L', icon: '<path d="M4 20 l1-4 L16 5 a1.6 1.6 0 0 1 2.3 0 l0.7 0.7 a1.6 1.6 0 0 1 0 2.3 L8 19 z"/><path d="M14.5 6.5 l3 3"/>' },
   { name: 'wall', label: '壁', kbd: 'W', icon: '<path d="M3 10 h18 M3 14 h18"/>' },
   { name: 'column', label: '柱', kbd: 'C', icon: '<rect x="8" y="8" width="8" height="8" fill="currentColor"/>' },
   { name: 'door', label: 'ドア', kbd: 'D', icon: '<path d="M4 12 h3 M17 12 h3 M7 12 v-7 M7 5 a10 10 0 0 1 10 7"/>' },
   { name: 'window', label: '窓', kbd: 'N', icon: '<path d="M3 10 h18 M3 14 h18 M8 12 h8"/>' },
   { name: 'stair', label: '階段', kbd: 'S', icon: '<path d="M3 20 h5 v-4 h5 v-4 h5 v-4 h3"/>' },
-  { name: 'furniture', label: '家具', kbd: 'F', icon: '<rect x="4" y="9" width="16" height="8" rx="1.5"/><path d="M6 17 v3 M18 17 v3 M4 12 h16"/>' },
-  { name: 'equipment', label: '設備', kbd: 'E', icon: '<circle cx="12" cy="12" r="7"/><path d="M12 5 v3 M12 16 v3 M5 12 h3 M16 12 h3"/>' },
+  { name: 'furniture', label: '家具/設備', kbd: 'F', icon: '<rect x="4" y="9" width="16" height="8" rx="1.5"/><path d="M6 17 v3 M18 17 v3 M4 12 h16"/>' },
   { name: 'planting', label: '植栽/人', kbd: 'P', icon: '<circle cx="12" cy="10" r="6"/><path d="M12 16 v5"/>' },
   { name: 'dimension', label: '寸法', kbd: 'M', icon: '<path d="M4 8 v8 M20 8 v8 M4 12 h16 M6 10 l-2 2 2 2 M18 10 l2 2 -2 2"/>' },
   { name: 'label', label: '文字', kbd: 'T', icon: '<path d="M6 6 h12 M12 6 v13"/>' },
-  { name: 'room', label: '部屋', kbd: 'A', icon: '<path d="M4 4 h16 v16 h-16 z" stroke-dasharray="3 2.4"/>' },
-  { name: 'pencil', label: '鉛筆', kbd: 'L', icon: '<path d="M4 20 l1-4 L16 5 a1.6 1.6 0 0 1 2.3 0 l0.7 0.7 a1.6 1.6 0 0 1 0 2.3 L8 19 z"/><path d="M14.5 6.5 l3 3"/>' }
+  { name: 'room', label: '部屋', kbd: 'A', icon: '<path d="M4 4 h16 v16 h-16 z" stroke-dasharray="3 2.4"/>' }
 ]
 
 const palette = $('#tool-palette')
@@ -47,7 +46,8 @@ for (const t of TOOL_DEFS) {
   palette.appendChild(b)
 }
 tm.onToolChange = t => {
-  palette.querySelectorAll('button').forEach(b => b.classList.toggle('active', b.dataset.tool === t))
+  palette.querySelectorAll('button').forEach(b => b.classList.toggle('active',
+    b.dataset.tool === t || (b.dataset.tool === 'furniture' && t === 'equipment'))) // 家具/設備は統合ボタン
   document.querySelectorAll('.comp-item').forEach(el => el.classList.toggle('active', t === 'component'))
   renderToolOptions()
 }
@@ -98,6 +98,59 @@ function checkbox(label: string, value: boolean, onchange: (v: boolean) => void)
   i.onchange = () => onchange(i.checked)
   return field(label, i)
 }
+/**
+ * 連動ロック付きの 2 段数値入力(Mac の寸法リンク風: 右にブラケット + 鎖トグル)。
+ * ロック中は片方を変更するともう片方も同じ値になる。
+ */
+function linkedPair(
+  label1: string, v1: number, label2: string, v2: number, locked: boolean,
+  onChange: (a: number, b: number, locked: boolean) => void
+): HTMLElement {
+  const wrap = document.createElement('div')
+  wrap.className = 'linked-pair'
+  const col = document.createElement('div')
+  col.className = 'lp-fields'
+  const i1 = numInput(v1, () => sync(1))
+  const i2 = numInput(v2, () => sync(2))
+  const sync = (src: 1 | 2): void => {
+    let a = Math.max(0, parseFloat(i1.value) || 0)
+    let b = Math.max(0, parseFloat(i2.value) || 0)
+    if (isLocked) {
+      if (src === 1) b = a; else a = b
+      i1.value = String(a); i2.value = String(b)
+    }
+    onChange(a, b, isLocked)
+  }
+  col.append(field(label1, i1), field(label2, i2))
+  let isLocked = locked
+  const link = document.createElement('div')
+  link.className = 'lp-link'
+  const btn = document.createElement('button')
+  btn.type = 'button'
+  const paint = (): void => {
+    btn.className = 'lp-btn' + (isLocked ? ' on' : '')
+    btn.title = isLocked ? '連動中(クリックで解除)' : '連動なし(クリックでロック)'
+    btn.dataset.tip = btn.title
+    btn.innerHTML = isLocked
+      ? '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 12h6M8 8V7a4 4 0 0 1 8 0v1M8 16v1a4 4 0 0 0 8 0v-1"/></svg>'
+      : '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 7V6a4 4 0 0 1 8 0v1M8 17v1a4 4 0 0 0 8 0v-1"/></svg>'
+  }
+  paint()
+  btn.onclick = () => {
+    isLocked = !isLocked
+    paint()
+    if (isLocked) { i2.value = i1.value; sync(1) }
+    else onChange(parseFloat(i1.value) || 0, parseFloat(i2.value) || 0, isLocked)
+  }
+  link.append(el('div', 'lp-bracket top'), btn, el('div', 'lp-bracket bottom'))
+  wrap.append(col, link)
+  return wrap
+}
+function el(tag: string, cls: string): HTMLElement {
+  const d = document.createElement(tag)
+  d.className = cls
+  return d
+}
 
 // ================= ツール設定パネル =================
 const toolOptions = $('#tool-options')
@@ -105,25 +158,18 @@ function renderToolOptions(): void {
   toolOptions.innerHTML = ''
   const t = tm.tool
   if (t === 'wall') {
-    // 厚さ = 基準線(通り芯)から右側 + 左側。ロックで左右対称に連動
-    const syncThickness = (): void => { params.wall.thickness = params.wall.offR + params.wall.offL; renderToolOptions() }
+    // 厚さ = 基準線(通り芯)から右側 + 左側。鎖アイコンで左右連動
     toolOptions.append(
       field('厚さ mm', numInput(params.wall.thickness, v => {
         params.wall.thickness = v
         params.wall.offR = v / 2; params.wall.offL = v / 2
         renderToolOptions()
       })),
-      field('基準線→右 mm', numInput(params.wall.offR, v => {
-        params.wall.offR = Math.max(0, v)
-        if (params.wall.lock) params.wall.offL = params.wall.offR
-        syncThickness()
-      })),
-      field('基準線→左 mm', numInput(params.wall.offL, v => {
-        params.wall.offL = Math.max(0, v)
-        if (params.wall.lock) params.wall.offR = params.wall.offL
-        syncThickness()
-      })),
-      checkbox('右/左を連動(ロック)', params.wall.lock, v => { params.wall.lock = v }),
+      linkedPair('基準線→右 mm', params.wall.offR, '基準線→左 mm', params.wall.offL, params.wall.lock,
+        (r, l, locked) => {
+          params.wall.offR = r; params.wall.offL = l; params.wall.lock = locked
+          params.wall.thickness = r + l
+        }),
       field('高さ mm', numInput(params.wall.height, v => { params.wall.height = v })),
       checkbox('構造壁(塗り)', params.wall.structural, v => { params.wall.structural = v }),
       checkbox('円弧壁(3点指定)', params.wall.arc, v => { params.wall.arc = v })
@@ -158,11 +204,17 @@ function renderToolOptions(): void {
       field('踏面 mm', numInput(params.stair.tread, v => { params.stair.tread = v })),
       field('蹴上げ mm', numInput(params.stair.riser, v => { params.stair.riser = v }))
     )
-  } else if (t === 'furniture') {
-    const kinds = (Object.entries(FURN_DEFAULTS) as [FurnKind, { label: string }][]).map(([k, v]) => [k, v.label] as [FurnKind, string])
-    toolOptions.append(field('種類', select(kinds, params.furniture.kind, v => { params.furniture.kind = v })))
-  } else if (t === 'equipment') {
-    toolOptions.append(field('種類', select(Object.entries(EQUIP_LABEL) as [EquipKind, string][], params.equipment.kind, v => { params.equipment.kind = v })))
+  } else if (t === 'furniture' || t === 'equipment') {
+    // 家具と設備は統合ツール: カテゴリで切替
+    toolOptions.append(field('カテゴリ', select(
+      [['furniture', '家具'], ['equipment', '設備']] as ['furniture' | 'equipment', string][],
+      t, v => tm.setTool(v))))
+    if (t === 'furniture') {
+      const kinds = (Object.entries(FURN_DEFAULTS) as [FurnKind, { label: string }][]).map(([k, v]) => [k, v.label] as [FurnKind, string])
+      toolOptions.append(field('種類', select(kinds, params.furniture.kind, v => { params.furniture.kind = v })))
+    } else {
+      toolOptions.append(field('種類', select(Object.entries(EQUIP_LABEL) as [EquipKind, string][], params.equipment.kind, v => { params.equipment.kind = v })))
+    }
   } else if (t === 'planting') {
     const PLANT_H: Record<PlantKind, number> = { tree: 3000, shrub: 600, person: 1900 }
     toolOptions.append(
@@ -398,10 +450,32 @@ function renderProperties(): void {
   propsEl.appendChild(title)
 
   switch (e.type) {
-    case 'wall':
+    case 'wall': {
       title.textContent = '壁'
+      // 基準線(通り芯)からの右/左寸法。編集しても基準線は動かさず、壁本体をオフセット
+      const refOff = e.refOff ?? 0
+      const offR = e.thickness / 2 - refOff
+      const offL = e.thickness / 2 + refOff
+      const applyRL = (r: number, l: number): void => upd(() => {
+        const d = { x: e.b.x - e.a.x, y: e.b.y - e.a.y }
+        const len = Math.hypot(d.x, d.y) || 1
+        const n = { x: -d.y / len, y: d.x / len }
+        const newRefOff = (l - r) / 2
+        const shift = refOff - newRefOff
+        e.a = { x: e.a.x + n.x * shift, y: e.a.y + n.y * shift }
+        e.b = { x: e.b.x + n.x * shift, y: e.b.y + n.y * shift }
+        e.thickness = Math.max(10, r + l)
+        e.refOff = newRefOff === 0 ? undefined : newRefOff
+      })
       propsEl.append(
-        field('厚さ mm', numInput(e.thickness, v => upd(() => { e.thickness = v }))),
+        field('厚さ mm', numInput(e.thickness, v => upd(() => {
+          // 厚さ変更は基準線からの比率を保って両側へ配分
+          const ratio = e.thickness > 0 ? v / e.thickness : 1
+          e.thickness = Math.max(10, v)
+          if (e.refOff) e.refOff *= ratio
+        }))),
+        linkedPair('基準線→右 mm', Math.round(offR), '基準線→左 mm', Math.round(offL), Math.abs(offR - offL) < 0.5,
+          (r, l) => applyRL(r, l)),
         field('高さ mm', numInput(e.height, v => upd(() => { e.height = v }))),
         checkbox('構造壁', e.structural, v => upd(() => { e.structural = v })),
         field('長さ mm', textInput(String(Math.round(Math.hypot(e.b.x - e.a.x, e.b.y - e.a.y))), () => {})),
@@ -409,6 +483,7 @@ function renderProperties(): void {
         colorField(e, upd)
       )
       break
+    }
     case 'opening': {
       title.textContent = OPENING_LABEL[e.kind]
       const kinds = (Object.entries(OPENING_LABEL) as [OpeningKind, string][])
@@ -447,10 +522,16 @@ function renderProperties(): void {
         colorField(e, upd)
       )
       break
-    case 'equipment':
+    case 'equipment': {
       title.textContent = EQUIP_LABEL[e.kind]
-      propsEl.append(field('種類', select(Object.entries(EQUIP_LABEL) as [EquipKind, string][], e.kind, v => upd(() => { e.kind = v }))))
+      const s = equipSize(e)
+      propsEl.append(
+        field('種類', select(Object.entries(EQUIP_LABEL) as [EquipKind, string][], e.kind, v => upd(() => { e.kind = v; e.w = undefined; e.d = undefined }))),
+        field('幅 mm', numInput(s.w, v => upd(() => { e.w = Math.max(100, v) }))),
+        field('奥行 mm', numInput(s.d, v => upd(() => { e.d = Math.max(80, v) })))
+      )
       break
+    }
     case 'column':
       title.textContent = e.shape === 'round' ? '丸柱' : '角柱'
       propsEl.append(
@@ -727,13 +808,17 @@ function applyGridStep(step: number): void {
 // ================= 選択オブジェクトのアクションアイコン =================
 const objActions = $('#obj-actions')
 objActions.querySelector('[data-act="rotate"]')!.addEventListener('click', () => {
-  if (!$('#view3d').hidden && view3d) {
+  const ids = [...renderer.selection]
+  const single = ids.length === 1 ? store.byId(ids[0]) : undefined
+  if (!$('#view3d').hidden && view3d && single && 'rot' in single) {
     // 3D: XYZ 回転リングをトグル(リングをドラッグで自由回転、45°ごとに吸着)
     view3d.rotateMode = !view3d.rotateMode
     view3d.highlightSelection()
     setMsg(view3d.rotateMode ? 'リングをドラッグして回転(緑=水平 / 赤=X傾き / 青=Z傾き)。もう一度 ⟳ で終了' : '')
   } else {
+    // 壁・部屋など rot を持たない要素は 90° 回転
     tm.rotateSelection()
+    if (!$('#view3d').hidden && view3d) view3d.rebuild(store)
   }
 })
 objActions.querySelector('[data-act="dup"]')!.addEventListener('click', () => beginDup())
@@ -748,6 +833,8 @@ tm.onSketchSub = sub => {
   eraseBtn.hidden = !(sub && (sub.mode === 'face' || sub.mode === 'loop') && sub.faceIdx !== undefined)
   renderProperties()
 }
+// ホバーで名前が見えるツールチップ(title より速く・確実に表示)
+objActions.querySelectorAll('button').forEach(b => { b.dataset.tip = b.title })
 objActions.querySelector('[data-act="del"]')!.addEventListener('click', () => {
   store.commit(); store.remove(renderer.selection)
   renderer.selection.clear(); renderProperties(); renderer.requestDraw()
@@ -776,6 +863,7 @@ const objListEl = $('#object-list')
 const objListGroupBtn = $('#objlist-group') as HTMLButtonElement
 objListGroupBtn.onclick = toggleGroup
 function entLabel(e: Entity): string {
+  if (e.dispName) return e.dispName
   switch (e.type) {
     case 'wall': return `壁 (${Math.round(Math.hypot(e.b.x - e.a.x, e.b.y - e.a.y))}mm)`
     case 'opening': return OPENING_LABEL[e.kind]
@@ -791,10 +879,44 @@ function entLabel(e: Entity): string {
     case 'sketch': return `スケッチ(${e.edges.length}辺)`
   }
 }
+const EYE_ON = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M2 12c1-2.5 5-7 10-7s9 4.5 10 7c-1 2.5-5 7-10 7S3 14.5 2 12z"/><circle cx="12" cy="12" r="3"/></svg>'
+const EYE_OFF = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 3l18 18M10.5 5.2A9.8 9.8 0 0 1 12 5c5 0 9 4.5 10 7-.4 1-1.3 2.4-2.6 3.7M6.6 6.6C4.1 8.1 2.5 10.5 2 12c1 2.5 5 7 10 7 1.6 0 3.1-.5 4.4-1.2"/></svg>'
+/** 折りたたみ中のグループ id */
+const collapsedGroups = new Set<string>()
+/** Shift+クリックの範囲選択の起点(表示順のインデックス) */
+let objAnchor = -1
 let objListSig = ''
+
+function mkEye(hidden: boolean, onToggle: () => void): HTMLButtonElement {
+  const eye = document.createElement('button')
+  eye.className = 'obj-eye' + (hidden ? ' off' : '')
+  eye.title = hidden ? '表示する' : '非表示にする'
+  eye.innerHTML = hidden ? EYE_OFF : EYE_ON
+  eye.onclick = ev => { ev.stopPropagation(); onToggle() }
+  return eye
+}
+function selectAndSync(): void {
+  tm.onSelectionChange()
+  renderer.requestDraw()
+  if (!$('#view3d').hidden) view3d?.highlightSelection()
+}
+function renameEntity(e: Entity): void {
+  const cur = entLabel(e)
+  const v = prompt('名前を変更', cur)
+  if (!v || v === cur) return
+  store.commit()
+  if (e.type === 'room') e.name = v
+  else if (e.type === 'label') e.text = v
+  else if (e.type === 'custom') e.label = v
+  else e.dispName = v
+  store.emit()
+}
+
 function renderObjectList(): void {
   const ents = store.doc.entities
+  const gNames = store.doc.meta.groupNames ?? {}
   const sig = ents.map(e => `${e.id}${e.hidden ? 'h' : ''}${e.group ?? ''}${renderer.selection.has(e.id) ? 's' : ''}${entLabel(e)}`).join('|')
+    + '|' + [...collapsedGroups].join(',') + '|' + JSON.stringify(gNames)
   if (sig === objListSig) return
   objListSig = sig
   objListEl.innerHTML = ''
@@ -803,49 +925,118 @@ function renderObjectList(): void {
     objListEl.innerHTML = '<div class="empty">要素がありません</div>'
     return
   }
-  for (const e of ents) {
+  // 表示順のフラットな要素リスト(Shift 範囲選択用)
+  const flat: Entity[] = []
+  const rowOf = (e: Entity, indent: boolean): HTMLElement => {
+    const idx = flat.length
+    flat.push(e)
     const row = document.createElement('div')
-    row.className = 'comp-item obj-row' + (renderer.selection.has(e.id) ? ' active' : '')
-    // 表示 / 非表示(目のアイコン)
-    const eye = document.createElement('button')
-    eye.className = 'obj-eye' + (e.hidden ? ' off' : '')
-    eye.title = e.hidden ? '表示する' : '非表示にする'
-    eye.innerHTML = e.hidden
-      ? '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 3l18 18M10.5 5.2A9.8 9.8 0 0 1 12 5c5 0 9 4.5 10 7-.4 1-1.3 2.4-2.6 3.7M6.6 6.6C4.1 8.1 2.5 10.5 2 12c1 2.5 5 7 10 7 1.6 0 3.1-.5 4.4-1.2"/></svg>'
-      : '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M2 12c1-2.5 5-7 10-7s9 4.5 10 7c-1 2.5-5 7-10 7S3 14.5 2 12z"/><circle cx="12" cy="12" r="3"/></svg>'
-    eye.onclick = ev => {
-      ev.stopPropagation()
+    row.className = 'comp-item obj-row' + (renderer.selection.has(e.id) ? ' active' : '') + (indent ? ' obj-child' : '')
+    row.appendChild(mkEye(!!e.hidden, () => {
       store.commit()
       e.hidden = !e.hidden || undefined
-      if (e.hidden) { renderer.selection.delete(e.id) }
+      if (e.hidden) renderer.selection.delete(e.id)
       store.emit()
-      tm.onSelectionChange()
-    }
+      selectAndSync()
+    }))
     const name = document.createElement('span')
     name.className = 'name'
-    name.textContent = (e.group ? '⛓ ' : '') + entLabel(e)
+    name.textContent = entLabel(e)
     if (e.hidden) name.style.opacity = '0.45'
-    row.append(eye, name)
+    row.appendChild(name)
     row.onclick = ev => {
-      if (ev.shiftKey) {
-        if (renderer.selection.has(e.id)) renderer.selection.delete(e.id)
-        else renderer.selection.add(e.id)
+      if (ev.shiftKey && objAnchor >= 0) {
+        // 範囲選択: 起点から今回クリックした行までを全て選択
+        const [a, b] = [Math.min(objAnchor, idx), Math.max(objAnchor, idx)]
+        renderer.selection.clear()
+        for (let i = a; i <= b; i++) renderer.selection.add(flat[i].id)
       } else {
         renderer.selection.clear()
         renderer.selection.add(e.id)
         store.expandGroups(renderer.selection)
+        objAnchor = idx
       }
-      tm.onSelectionChange()
-      renderer.requestDraw()
-      if (!$('#view3d').hidden) view3d?.highlightSelection()
+      selectAndSync()
     }
-    objListEl.appendChild(row)
+    row.ondblclick = () => renameEntity(e)
+    return row
+  }
+  // グループ → ブロック化(初出のグループ位置に、ヘッダ + インデントした子)
+  const emitted = new Set<string>()
+  for (const e of ents) {
+    if (!e.group) { objListEl.appendChild(rowOf(e, false)); continue }
+    if (emitted.has(e.group)) continue
+    emitted.add(e.group)
+    const gid = e.group
+    const members = ents.filter(m => m.group === gid)
+    const collapsed = collapsedGroups.has(gid)
+    const allHidden = members.every(m => m.hidden)
+    const head = document.createElement('div')
+    head.className = 'comp-item obj-row obj-group' + (members.every(m => renderer.selection.has(m.id)) ? ' active' : '')
+    // 折りたたみ
+    const chev = document.createElement('button')
+    chev.className = 'obj-chev'
+    chev.textContent = collapsed ? '▸' : '▾'
+    chev.title = collapsed ? '展開' : '折りたたむ'
+    chev.onclick = ev => {
+      ev.stopPropagation()
+      if (collapsed) collapsedGroups.delete(gid); else collapsedGroups.add(gid)
+      objListSig = ''
+      renderObjectList()
+    }
+    // グループ一括の表示 / 非表示
+    head.append(chev, mkEye(allHidden, () => {
+      store.commit()
+      const to = !allHidden
+      for (const m of members) {
+        m.hidden = to || undefined
+        if (to) renderer.selection.delete(m.id)
+      }
+      store.emit()
+      selectAndSync()
+    }))
+    const gname = document.createElement('span')
+    gname.className = 'name'
+    gname.textContent = `${gNames[gid] ?? 'グループ'} (${members.length})`
+    head.appendChild(gname)
+    // グループ解除
+    const un = document.createElement('button')
+    un.className = 'obj-ungroup'
+    un.title = 'グループ解除'
+    un.dataset.tip = 'グループ解除'
+    un.innerHTML = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="8" height="8" rx="1.5"/><rect x="13" y="13" width="8" height="8" rx="1.5"/><path d="M4 20 20 4" stroke-dasharray="2.5 2"/></svg>'
+    un.onclick = ev => {
+      ev.stopPropagation()
+      store.commit()
+      for (const m of members) delete m.group
+      store.emit()
+      selectAndSync()
+    }
+    head.appendChild(un)
+    head.onclick = () => {
+      renderer.selection.clear()
+      for (const m of members) renderer.selection.add(m.id)
+      selectAndSync()
+    }
+    head.ondblclick = () => {
+      const v = prompt('グループ名', gNames[gid] ?? 'グループ')
+      if (!v) return
+      store.commit()
+      store.doc.meta.groupNames = { ...gNames, [gid]: v }
+      store.emit()
+    }
+    objListEl.appendChild(head)
+    if (!collapsed) for (const m of members) objListEl.appendChild(rowOf(m, true))
   }
 }
 store.onChange(() => renderObjectList())
 function updateObjActions(): void {
   const ids = [...renderer.selection]
   if (!ids.length) { objActions.hidden = true; return }
+  // 消しゴムはスケッチの面を選択中のみ(選択が変わったら隠す)
+  const sub = tm.sketchSub
+  eraseBtn.hidden = !(sub && (sub.mode === 'face' || sub.mode === 'loop') &&
+    sub.faceIdx !== undefined && renderer.selection.has(sub.id))
   // 3D モード: 選択メッシュのバウンディングボックス上端に表示
   if (!$('#view3d').hidden) {
     const p = view3d?.projectSelection(renderer.selection)
@@ -940,6 +1131,13 @@ function chipDefs(e: import('./model').Entity): ChipDef[] {
         { label: '幅', value: e.w, apply: v => upd(() => { e.w = Math.max(50, v) }) },
         { label: '奥行', value: e.d, apply: v => upd(() => { e.d = Math.max(50, v) }) }
       ]
+    case 'equipment': {
+      const s = equipSize(e)
+      return [
+        { label: '幅', value: s.w, apply: v => upd(() => { e.w = Math.max(100, v) }) },
+        { label: '奥行', value: s.d, apply: v => upd(() => { e.d = Math.max(80, v) }) }
+      ]
+    }
     case 'stair':
       return [{ label: '幅', value: e.width, apply: v => upd(() => { e.width = Math.max(300, v) }) }]
     case 'planting':
@@ -1316,6 +1514,10 @@ async function ensure3D(): Promise<View3D> {
     view3d.getRoomPts = () => (tm.tool === 'pencil' ? tm.pencilPoints : tm.roomPoints)
     view3d.getDimPts = () => tm.dimPoints
     view3d.getGrid = () => renderer.gridStep
+    view3d.getRectStart = () => tm.rectStartPt
+    view3d.getSnapInfo = p => tm.snapInfo(p)   // 2D と同じスナップ・ガイドを 3D でも使う
+    view3d.getDupAwait = () => tm.awaitingDupBase
+    view3d.onDupBase3D = p => tm.pickDupBase(p)
     view3d.getPreviewEntity = p => {
       const t = tm.tool
       switch (t) {
@@ -1362,11 +1564,19 @@ async function ensure3D(): Promise<View3D> {
     }
     view3d.onEdited = () => { store.emit() }
     view3d.getTool = () => tm.tool
-    view3d.onPlace = (p, wallId, levelIndex) => {
+    view3d.onPlace = (p, wallId, levelIndex, noSnap) => {
       if (levelIndex !== store.active) store.setLevel(levelIndex)
-      tm.placeAt(p, { wallId })
+      tm.placeAt(p, { wallId, noSnap })
     }
-    view3d.onCancel = () => tm.cancel()
+    view3d.onCancel = () => {
+      // 複写(基準点待ち・配置中)の右クリックは選択ツールへ戻る
+      if (tm.awaitingDupBase || tm.tool === 'component') {
+        tm.cancel()
+        tm.setTool('select')
+      } else {
+        tm.cancel()
+      }
+    }
     setMsg('')
   }
   return view3d
@@ -1382,16 +1592,99 @@ store.onChange(() => {
     if (!$('#view3d').hidden && view3d) view3d.rebuild(store)
   })
 })
-// ================= 視点プルダウン(2D: 平面図 / 3D: 立面・アイソメ) =================
-const viewSelect = $('#view-select') as HTMLSelectElement
-viewSelect.onchange = () => void applyViewPreset(viewSelect.value)
+// ================= 視点プルダウン(2D: 平面・立面 / 3D: アイソメ) =================
+// ネイティブ select は OS によってグループが省略表示されるため、常に全項目が見えるカスタムメニュー
+const VIEW_OPTS: { group: string; items: [string, string][] }[] = [
+  { group: '2D ビュー', items: [['plan', '平面図'], ['elev-front', '正面図'], ['elev-back', '背面図'], ['elev-right', '右側面図'], ['elev-left', '左側面図']] },
+  { group: '3D ビュー', items: [['iso-sw', '南西アイソメ'], ['iso-se', '南東アイソメ'], ['iso-nw', '北西アイソメ'], ['iso-ne', '北東アイソメ']] }
+]
+let curView = 'plan'
+const viewBtn = $('#view-btn')
+const viewLabel = (v: string): string =>
+  VIEW_OPTS.flatMap(g => g.items).find(([id]) => id === v)?.[1] ?? v
+function setViewBtnLabel(): void {
+  viewBtn.innerHTML = `${esc(viewLabel(curView))} <span class="caret">▾</span>`
+}
+let viewPop: HTMLDivElement | null = null
+viewBtn.onclick = () => {
+  if (viewPop) { viewPop.remove(); viewPop = null; return }
+  const pop = document.createElement('div')
+  viewPop = pop
+  pop.className = 'comp-menu view-pop'
+  for (const g of VIEW_OPTS) {
+    const t = document.createElement('div')
+    t.className = 'cp-title'
+    t.textContent = g.group
+    pop.appendChild(t)
+    for (const [id, label] of g.items) {
+      const b = document.createElement('button')
+      b.innerHTML = `<span class="check">${id === curView ? '✓' : ''}</span>${esc(label)}`
+      b.onclick = () => { pop.remove(); viewPop = null; void applyViewPreset(id) }
+      pop.appendChild(b)
+    }
+  }
+  document.body.appendChild(pop)
+  const r = viewBtn.getBoundingClientRect()
+  pop.style.top = `${r.bottom + 4}px`
+  pop.style.left = `${Math.min(r.left, innerWidth - pop.offsetWidth - 8)}px`
+  setTimeout(() => {
+    const onDoc = (ev: MouseEvent): void => {
+      if (!pop.contains(ev.target as Node) && ev.target !== viewBtn) {
+        pop.remove(); viewPop = null
+        document.removeEventListener('pointerdown', onDoc)
+      }
+    }
+    document.addEventListener('pointerdown', onDoc)
+  })
+}
 async function applyViewPreset(v: string): Promise<void> {
-  if (v === 'plan') { await switchTab('2d'); return }
+  curView = v
+  setViewBtnLabel()
+  if (v === 'plan') {
+    renderer.elevation = null
+    renderElevationChips()
+    await switchTab('2d')
+    renderer.requestDraw()
+    return
+  }
+  if (v.startsWith('elev-')) {
+    // 2D の立面図(正面・背面・左右側面)
+    await switchTab('2d')
+    renderer.elevation = { dir: v.slice(5) as 'front' | 'back' | 'left' | 'right', cluster: 0 }
+    renderElevationChips()
+    renderer.requestDraw()
+    return
+  }
+  renderer.elevation = null
+  renderElevationChips()
   await switchTab('3d')
   view3d?.setView(v as import('./view3d').ViewPreset)
 }
+// 立面図: どの建物か(複数棟のとき)を選ぶチップ
+const elevChips = $('#elev-chips')
+function renderElevationChips(): void {
+  const el = renderer.elevation
+  if (!el) { elevChips.hidden = true; return }
+  const clusters = renderer.buildingClusters()
+  elevChips.innerHTML = ''
+  const dirLabel = { front: '正面図', back: '背面図', right: '右側面図', left: '左側面図' }[el.dir]
+  const title = document.createElement('span')
+  title.className = 'elev-title'
+  title.textContent = `${dirLabel}(閲覧専用)`
+  elevChips.appendChild(title)
+  if (clusters.length > 1) {
+    clusters.forEach((_, i) => {
+      const b = document.createElement('button')
+      b.textContent = `建物 ${i + 1}`
+      b.classList.toggle('active', i === el.cluster)
+      b.onclick = () => { el.cluster = i; renderElevationChips(); renderer.requestDraw() }
+      elevChips.appendChild(b)
+    })
+  }
+  elevChips.hidden = false
+}
 async function switchTab(t: '2d' | '3d'): Promise<void> {
-  if (t === '2d') viewSelect.value = 'plan'
+  if (t === '2d' && !curView.startsWith('elev-') && curView !== 'plan') { curView = 'plan'; setViewBtnLabel() }
   const v3 = $('#view3d')
   $('#scale-bar').style.display = t === '3d' ? 'none' : ''
   if (t === '3d') {
@@ -1550,18 +1843,6 @@ function restoreAutosave(): boolean {
 }
 
 // ================= 3D モデリングツールバー =================
-$('#btn3d-rot').onclick = async () => {
-  const v = await ensure3D()
-  v.rotateMode = !v.rotateMode
-  $('#btn3d-rot').classList.toggle('active', v.rotateMode)
-  v.highlightSelection()
-  setMsg(v.rotateMode ? 'リングをドラッグして回転(45°ごとに吸着)' : '')
-}
-$('#btn3d-del').onclick = () => {
-  if (!renderer.selection.size) return
-  store.commit(); store.remove(renderer.selection)
-  renderer.selection.clear(); renderProperties()
-}
 $('#btn3d-measure').onclick = async () => {
   const v = await ensure3D()
   v.measureOn = !v.measureOn

@@ -4,11 +4,12 @@
 import * as THREE from 'three'
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
 import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js'
-import { Store, Wall, Opening, Entity, SketchE, isWindow, MATERIALS, TexKind, FURN_DEFAULTS } from './model'
+import { Store, Wall, Opening, Entity, SketchE, isWindow, MATERIALS, TexKind, FURN_DEFAULTS, EQUIP_SIZE, equipSize } from './model'
 import {
   Pt, pt, sub, norm, dist, distToSeg, snapTo, angleDetentDeg,
   sketchFaces, faceNesting, faceInfo, faceKey, polyCentroid
 } from './geometry'
+import { SketchOverlay, axisLock, SnapInfo } from './sketchInput'
 
 const M = 1 / 1000 // mm → m
 
@@ -62,7 +63,10 @@ const MAT = {
   white: new THREE.MeshLambertMaterial({ color: 0xfafafa }),
   dark: new THREE.MeshLambertMaterial({ color: 0x374151 }),
   water: new THREE.MeshLambertMaterial({ color: 0x93c5fd, transparent: true, opacity: 0.6 }),
-  selected: new THREE.MeshLambertMaterial({ color: 0x93b4f8, emissive: 0x1d4ed8, emissiveIntensity: 0.18 })
+  selected: new THREE.MeshLambertMaterial({ color: 0x93b4f8, emissive: 0x1d4ed8, emissiveIntensity: 0.18 }),
+  // スケッチ(鉛筆)の面: 平面 = 薄い青 / 押し出した立体 = 明るいグレージュ(両面描画で裏からも見える)
+  sketchFace: new THREE.MeshLambertMaterial({ color: 0xaecbea, side: THREE.DoubleSide }),
+  sketchSolid: new THREE.MeshLambertMaterial({ color: 0xd8d2c4 })
 }
 
 // ---------------- マテリアル(仕上げ): Canvas でテクスチャを生成(外部画像なし) ----------------
@@ -245,8 +249,8 @@ export class View3D {
   getSnap: () => number = () => 455
   /** 現在の 2D ツール(3D 上での配置に使う) */
   getTool: () => string = () => 'select'
-  /** 3D 上でのクリック配置(wallId は壁を直接クリックした場合) */
-  onPlace: (p: Pt, wallId: string | undefined, levelIndex: number) => void = () => {}
+  /** 3D 上でのクリック配置(wallId は壁を直接クリックした場合。noSnap = スナップ済みの点) */
+  onPlace: (p: Pt, wallId: string | undefined, levelIndex: number, noSnap?: boolean) => void = () => {}
   onCancel: () => void = () => {}
   private raycaster = new THREE.Raycaster()
   private dragging: { id: string; level: number; planeY: number; last: THREE.Vector3 } | null = null
@@ -307,6 +311,20 @@ export class View3D {
   getWallStart: () => Pt | null = () => null
   getRoomPts: () => Pt[] = () => []
   getDimPts: () => Pt[] = () => []
+  /** 長方形モード(部屋・鉛筆)の始点(2D 側と共有) */
+  getRectStart: () => Pt | null = () => null
+  /** 2D と同じスナップ(端点・中点・延長など)。main が ToolManager を配線 */
+  getSnapInfo: (p: Pt) => SnapInfo = p => ({ p, kind: null, guides: [] })
+  /** 基準点複写: 基準点の選択待ちか / 基準点が picked されたとき */
+  getDupAwait: () => boolean = () => false
+  onDupBase3D: (p: Pt) => void = () => {}
+  /** 共通の作図オーバーレイ(十字カーソル・ライブ線・ガイド・青寸法) */
+  private sketchOv: SketchOverlay
+  /** 直近の作図カーソル(スナップ・軸ロック済み)。クリック配置に使う */
+  private lastPlanPoint: Pt | null = null
+  /** 計測のライブ線・メジャーアイコン */
+  private measureLive: THREE.Line
+  private rulerIcon: HTMLDivElement
 
   /** 1 フレームに 1 回だけ再構築(プッシュ/プル中の軽量化) */
   private rebuildSoon(): void {
@@ -376,6 +394,21 @@ export class View3D {
     }
     this.dimGroup.visible = false
     this.scene.add(this.dimGroup)
+
+    // 共通の作図オーバーレイ(鉛筆・部屋・計測)
+    this.sketchOv = new SketchOverlay(container, M)
+    this.scene.add(this.sketchOv.group)
+    this.measureLive = new THREE.Line(
+      new THREE.BufferGeometry(),
+      new THREE.LineDashedMaterial({ color: 0xf59e0b, dashSize: 0.12, gapSize: 0.08, depthTest: false }))
+    this.measureLive.renderOrder = 999
+    this.measureLive.visible = false
+    this.scene.add(this.measureLive) // measureGroup は clear されるため別持ち
+    this.rulerIcon = document.createElement('div')
+    this.rulerIcon.className = 'ruler3d'
+    this.rulerIcon.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="#f59e0b" stroke-width="1.8" stroke-linejoin="round"><rect x="2.5" y="9" width="19" height="6.5" rx="1" transform="rotate(-25 12 12)"/><path d="M7 13.4l1-2.2M10.6 11.7l1-2.2M14.2 10l1-2.2" transform="rotate(0)"/></svg>'
+    this.rulerIcon.style.display = 'none'
+    container.appendChild(this.rulerIcon)
 
     // ドラッグ中の寸法・計測結果の表示用フローティングラベル
     this.hint3d = document.createElement('div')
@@ -713,6 +746,9 @@ export class View3D {
     this.measureGroup.traverse(o => { if (o instanceof THREE.Mesh || o instanceof THREE.Line) o.geometry.dispose() })
     this.measureGroup.clear()
     this.measureA = null
+    this.measureLive.visible = false
+    this.rulerIcon.style.display = 'none'
+    this.sketchOv.hide()
     this.hideHint()
     this.render()
   }
@@ -780,6 +816,7 @@ export class View3D {
       }
     }
     if (this.getTool() !== 'select') return // 配置ツール中はクリック(up)で配置。ドラッグはカメラ操作のまま
+    if (this.getDupAwait()) return // 基準点複写中はクリック(up)で基準点を拾う
     // 選択は編集中の階のオブジェクトのみ(1F 編集中は 1F だけ選べる)
     const hit = this.pick(e, true)
     if (!hit) {
@@ -839,6 +876,47 @@ export class View3D {
   }
 
   private pointerMove(e: PointerEvent): void {
+    // 計測モード: オレンジの十字カーソル + メジャーアイコン + ライブ距離
+    if (this.measureOn && this.store) {
+      const r = this.container.getBoundingClientRect()
+      this.rulerIcon.style.display = 'block'
+      this.rulerIcon.style.left = `${e.clientX - r.left + 14}px`
+      this.rulerIcon.style.top = `${e.clientY - r.top - 24}px`
+      const hit = this.pick(e)
+      let p3: THREE.Vector3 | null = null
+      let snap: SnapInfo | null = null
+      if (hit) {
+        p3 = hit.point.clone()
+      } else {
+        const gp = this.groundPoint(e)
+        if (gp) {
+          snap = this.getSnapInfo(gp)
+          p3 = new THREE.Vector3(snap.p.x * M, this.levelYs[this.store.active] ?? 0, snap.p.y * M)
+        }
+      }
+      if (p3) {
+        const dims: { text: string; at: Pt }[] = []
+        if (this.measureA) {
+          this.measureLive.visible = true
+          this.measureLive.geometry.setFromPoints([this.measureA, p3])
+          this.measureLive.computeLineDistances()
+          const mm = Math.round(this.measureA.distanceTo(p3) * 1000)
+          dims.push({ text: `${mm} mm`, at: pt((this.measureA.x / M + p3.x / M) / 2, (this.measureA.z / M + p3.z / M) / 2) })
+        }
+        this.sketchOv.update({
+          camera: this.camera, canvas: this.renderer.domElement,
+          cursor: pt(p3.x / M, p3.z / M), y: p3.y, snap, color: 0xf59e0b, dims
+        })
+      }
+      this.render()
+      return
+    }
+    if (this.rulerIcon.style.display !== 'none') {
+      this.rulerIcon.style.display = 'none'
+      this.measureLive.visible = false
+    }
+    // 基準点複写: 基準点の選択待ちは十字カーソル
+    if (this.getDupAwait()) this.renderer.domElement.style.cursor = 'crosshair'
     if (this.rotDrag && this.store) {
       const ent = this.store.byId(this.rotDrag.id)
       if (!ent) return
@@ -1165,12 +1243,21 @@ export class View3D {
     }
     this.controls.enabled = true
     if (e.button !== 0 || !this.store || moved) return
-    // 計測モード: 2 点クリックで距離を測る
+    // 基準点複写: クリック = 基準点(スナップ付き)
+    if (this.getDupAwait()) {
+      const gp = this.groundPoint(e)
+      if (gp) this.onDupBase3D(gp)
+      this.renderer.domElement.style.cursor = ''
+      return
+    }
+    // 計測モード: 2 点クリックで距離を測る(空中はスナップ付きの床面)
     if (this.measureOn) {
       const hit = this.pick(e)
       const p = hit ? hit.point.clone() : (() => {
         const gp = this.groundPoint(e)
-        return gp ? new THREE.Vector3(gp.x * M, this.levelYs[this.store.active] ?? 0, gp.y * M) : null
+        if (!gp) return null
+        const sp = this.getSnapInfo(gp).p
+        return new THREE.Vector3(sp.x * M, this.levelYs[this.store.active] ?? 0, sp.y * M)
       })()
       if (!p) return
       const marker = new THREE.Mesh(new THREE.SphereGeometry(0.05, 10, 8),
@@ -1205,6 +1292,11 @@ export class View3D {
       return
     }
     if (tool !== 'select') {
+      // 部屋・鉛筆・寸法はプレビューでスナップ・軸ロック済みの点をそのまま使う
+      if ((tool === 'room' || tool === 'pencil' || tool === 'dimension') && this.lastPlanPoint) {
+        this.onPlace(this.lastPlanPoint, undefined, this.store.active, true)
+        return
+      }
       const p = this.groundPoint(e)
       if (p) this.onPlace(p, undefined, this.store.active)
       return
@@ -1258,6 +1350,7 @@ export class View3D {
   }
 
   hidePreview(): void {
+    this.sketchOv.hide()
     if (!this.preview.visible) return
     this.preview.visible = false
     this.hideHint()
@@ -1274,6 +1367,7 @@ export class View3D {
     this.previewPole.visible = false
     this.previewLine.visible = false
     this.previewCustom.visible = false
+    if (tool !== 'room' && tool !== 'dimension' && tool !== 'pencil') this.sketchOv.hide()
     const info = this.getPreview()
 
     if (tool === 'door' || tool === 'window') {
@@ -1312,18 +1406,24 @@ export class View3D {
         }
       }
     } else if (tool === 'room' || tool === 'dimension' || tool === 'pencil') {
+      // 2D と同じ十字カーソル・スナップガイド・軸平行ガイド・青寸法のオーバーレイ
       const gp = this.groundPoint(e)
-      const pts = tool === 'dimension' ? this.getDimPts() : this.getRoomPts()
       if (gp) {
-        const v: THREE.Vector3[] = pts.map(q => new THREE.Vector3(q.x * M, yBase + 0.03, q.y * M))
-        v.push(new THREE.Vector3(snapTo(gp.x, this.getSnap()) * M, yBase + 0.03, snapTo(gp.y, this.getSnap()) * M))
-        if (v.length >= 2) {
-          this.previewLine.visible = true
-          this.previewLine.geometry.setFromPoints(v)
+        const snap = this.getSnapInfo(gp)
+        const pts = tool === 'dimension' ? this.getDimPts() : this.getRoomPts()
+        const rectStart = tool === 'dimension' ? null : this.getRectStart()
+        let cur = snap.p
+        let axis: 'x' | 'y' | null = null
+        if (!snap.kind || snap.kind === 'グリッド') {
+          const al = axisLock(rectStart ?? (pts.length ? pts[pts.length - 1] : null), snap.p)
+          cur = al.p
+          axis = al.axis
         }
-        this.previewPole.visible = true
-        this.previewPole.scale.set(1, 0.6, 1)
-        this.previewPole.position.set(v[v.length - 1].x, yBase + 0.3, v[v.length - 1].z)
+        this.lastPlanPoint = cur
+        this.sketchOv.update({
+          camera: this.camera, canvas: this.renderer.domElement,
+          cursor: cur, y: yBase, pts, rectStart, snap, axis
+        })
       }
     } else if (info) {
       const gp = this.groundPoint(e)
@@ -1408,7 +1508,7 @@ export class View3D {
           ]
           const ln = new THREE.Line(
             new THREE.BufferGeometry().setFromPoints(ptsL),
-            new THREE.LineDashedMaterial({ color: 0x9ca3af, dashSize: 0.16, gapSize: 0.12, transparent: true, opacity: 0.7 }))
+            new THREE.LineDashedMaterial({ color: 0x3b82f6, dashSize: 0.16, gapSize: 0.12, transparent: true, opacity: 0.65 }))
           ln.computeLineDistances()
           this.floorLines.add(ln)
         }
@@ -1628,6 +1728,10 @@ export class View3D {
     const g = new THREE.Group()
     g.position.set(e.pos.x * M, 0, e.pos.y * M)
     g.rotation.y = -e.rot
+    // リサイズ対応: 基準サイズ比で水平スケール(取付高さは維持)
+    const base = EQUIP_SIZE[e.kind]
+    const s = equipSize(e)
+    g.scale.set(s.w / base.w, 1, s.d / base.d)
     const metal = MAT.equipment, white = MAT.white
     switch (e.kind) {
       case 'ventfan': { // 換気扇: 壁付けの丸型フード + 羽根
@@ -1776,7 +1880,7 @@ export class View3D {
         geo.rotateX(Math.PI / 2)
         geo.translate(0, 0.004, 0) // 床とのZファイト防止
       }
-      const mesh = new THREE.Mesh(geo, hM > 0.001 ? MAT.wall : MAT.stair)
+      const mesh = new THREE.Mesh(geo, hM > 0.001 ? MAT.sketchSolid : MAT.sketchFace)
       g.add(mesh)
     }
     // 辺(色付き)

@@ -1,7 +1,8 @@
 // JIS A 0150(建築製図通則)の平面表示記号に準拠した 2D 記号描画
 // ctx はワールド座標(mm)に変換済み。線幅は zoom で割って画面ピクセル一定にする。
 import {
-  Wall, Opening, Stair, Furniture, Equipment, Planting, DimensionE, LabelE, Room, SketchE, isWindow, MATERIALS
+  Wall, Opening, Stair, Furniture, Equipment, Planting, DimensionE, LabelE, Room, SketchE,
+  isWindow, MATERIALS, EQUIP_SIZE, equipSize
 } from './model'
 import {
   Pt, sub, norm, perp, lerp, dist, netPolyArea, labelAnchor,
@@ -290,6 +291,10 @@ export function drawCustom(ctx: CanvasRenderingContext2D, e: import('./model').C
 export function drawEquipment(ctx: CanvasRenderingContext2D, e: Equipment, zoom: number): void {
   ctx.save()
   ctx.translate(e.pos.x, e.pos.y); ctx.rotate(e.rot)
+  // リサイズ対応: 基準サイズに対する比率でスケール
+  const base = EQUIP_SIZE[e.kind]
+  const s = equipSize(e)
+  ctx.scale(s.w / base.w, s.d / base.d)
   ctx.strokeStyle = INK; ctx.fillStyle = '#fff'; lw(ctx, zoom, 1)
   switch (e.kind) {
     case 'boiler':

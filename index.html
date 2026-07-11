@@ -31,22 +31,7 @@
         <button id="copy-below" title="下階の壁・柱をこの階に複製">下階の壁をコピー</button>
       </div>
       <div class="tabs">
-        <select id="view-select" title="視点の切替">
-          <optgroup label="2D ビュー">
-            <option value="plan" selected>平面図</option>
-            <option value="bottom">下面図</option>
-            <option value="right">右側面図</option>
-            <option value="left">左側面図</option>
-            <option value="front">正面図</option>
-            <option value="back">背面図</option>
-          </optgroup>
-          <optgroup label="3D ビュー">
-            <option value="iso-sw">南西アイソメ</option>
-            <option value="iso-se">南東アイソメ</option>
-            <option value="iso-nw">北西アイソメ</option>
-            <option value="iso-ne">北東アイソメ</option>
-          </optgroup>
-        </select>
+        <button id="view-btn" title="視点の切替">平面図 <span class="caret">▾</span></button>
       </div>
     </header>
 
@@ -55,9 +40,6 @@
         <canvas id="canvas2d"></canvas>
         <div id="view3d" hidden>
           <div id="view3d-toolbar">
-            <button id="btn3d-rot" title="回転リング(自由回転、45°吸着)">回転</button>
-            <button id="btn3d-del" title="選択を削除 (Del)">削除</button>
-            <span class="sep"></span>
             <button id="btn3d-measure" title="2点間の距離を計測">計測</button>
             <button id="btn3d-png" title="現在のビューを PNG 画像で保存">PNG</button>
             <span class="sep"></span>
@@ -91,6 +73,7 @@
           </div>
         </div>
         <div id="hint-bar"></div>
+        <div id="elev-chips" hidden></div>
         <div id="scale-bar" title="縮尺">
           <div class="segs"></div>
           <div class="label"></div>

@@ -5,7 +5,9 @@ import * as THREE from 'three'
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
 import { Evaluator, Brush, ADDITION, SUBTRACTION, INTERSECTION } from 'three-bvh-csg'
 import { CustomE, uid } from './model'
-import { angleDetentDeg } from './geometry'
+import { Pt, pt, dist, angleDetentDeg, snapTo } from './geometry'
+import { SketchOverlay, axisLock, SnapInfo } from './sketchInput'
+import { params } from './tools'
 
 type PartKind = 'box' | 'cyl' | 'sphere' | 'cone' | 'poly' | 'baked'
 export interface StudioPart {
@@ -166,6 +168,8 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
       </div>
     </div>`
   document.body.appendChild(modal)
+  // アイコンのホバーで名前を表示
+  modal.querySelectorAll('button[title]').forEach(b => { (b as HTMLElement).dataset.tip = (b as HTMLElement).title })
   ;(modal.querySelector('.st-name') as HTMLInputElement).value = initial?.name ?? 'オリジナル部品'
   ;(modal.querySelector('.st-label') as HTMLInputElement).value = initial?.label ?? ''
   ;(modal.querySelector('.st-symbol') as HTMLSelectElement).value = initial?.symbol ?? 'rect'
@@ -224,13 +228,61 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
   let rotMode = false
   const primary = (): number => (selSet.size ? Math.max(...selSet) : -1)
 
-  // ---------- 鉛筆(多角形 → 押し出し) ----------
+  // ---------- 鉛筆(多角形 / 長方形 → 押し出し)。3D モードと同じ入力機構(sketchInput)を共用 ----------
   let penMode = false
-  let penPts: THREE.Vector3[] = []
-  const penLine = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0x2563eb }))
-  penLine.visible = false
-  scene.add(penLine)
+  let penPts: Pt[] = []                 // mm(平面)
+  let penRectStart: Pt | null = null
+  const sketchOv = new SketchOverlay(viewEl, MM)
+  scene.add(sketchOv.group)
   const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0)
+  /** クリック位置 → 平面 mm 座標 */
+  const groundPt = (e: PointerEvent): Pt | null => {
+    ray.setFromCamera(ndc(e), camera)
+    const q = new THREE.Vector3()
+    if (!ray.ray.intersectPlane(groundPlane, q)) return null
+    return pt(q.x / MM, q.z / MM)
+  }
+  /** スタジオ内のスナップ: 描画中の点・パーツの中心 / 角に吸着 → なければ 10mm グリッド */
+  const studioSnap = (p: Pt): SnapInfo => {
+    const tol = 60
+    const cands: { p: Pt; kind: string }[] = penPts.map(q => ({ p: q, kind: '端点' }))
+    for (const part of parts) {
+      cands.push({ p: pt(part.x, part.z), kind: '中心' })
+      const hw = part.sx / 2, hd = part.sz / 2
+      const rad = (part.rot * Math.PI) / 180
+      const cos = Math.cos(rad), sin = Math.sin(rad)
+      for (const sx of [-1, 1]) {
+        for (const sz of [-1, 1]) {
+          cands.push({
+            p: pt(part.x + sx * hw * cos - sz * hd * sin, part.z + sx * hw * sin + sz * hd * cos),
+            kind: '端点'
+          })
+        }
+      }
+    }
+    let best: { p: Pt; kind: string } | null = null
+    let bd = tol
+    for (const c of cands) {
+      const d = dist(p, c.p)
+      if (d < bd) { bd = d; best = c }
+    }
+    if (best) return { p: { ...best.p }, kind: best.kind, guides: [] }
+    return { p: pt(snapTo(p.x, 10), snapTo(p.y, 10)), kind: 'グリッド', guides: [] }
+  }
+  /** スナップ + 軸平行ロックを適用したカーソル */
+  const penCursor = (e: PointerEvent): { cur: Pt; snap: SnapInfo; axis: 'x' | 'y' | null } | null => {
+    const gp = groundPt(e)
+    if (!gp) return null
+    const snap = studioSnap(gp)
+    let cur = snap.p
+    let axis: 'x' | 'y' | null = null
+    if (snap.kind === 'グリッド') {
+      const al = axisLock(penRectStart ?? (penPts.length ? penPts[penPts.length - 1] : null), snap.p)
+      cur = al.p
+      axis = al.axis
+    }
+    return { cur, snap, axis }
+  }
 
   // ---------- ギズモ ----------
   const mkSquare = (kind: string, x: number, y: number, z: number, color = 0x2563eb): void => {
@@ -494,39 +546,38 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
   const setPenMode = (on: boolean): void => {
     penMode = on
     penPts = []
-    penLine.visible = false
+    penRectStart = null
+    sketchOv.hide()
     penButton.classList.toggle('active', on)
     render()
   }
+  /** 多角形(mm)をパーツ化 */
+  const makePolyPart = (poly: Pt[]): void => {
+    if (poly.length < 3) return
+    const xs = poly.map(q => q.x), ys = poly.map(q => q.y)
+    const cx = (Math.min(...xs) + Math.max(...xs)) / 2
+    const cy = (Math.min(...ys) + Math.max(...ys)) / 2
+    const bw = Math.max(10, Math.round(Math.max(...xs) - Math.min(...xs)))
+    const bh = Math.max(10, Math.round(Math.max(...ys) - Math.min(...ys)))
+    parts.push({
+      kind: 'poly', op: 'add',
+      x: Math.round(cx), y: 0, z: Math.round(cy),
+      sx: bw, sy: 400, sz: bh, rot: 0,
+      pts: poly.map(q => ({ x: Math.round(q.x - cx), y: Math.round(q.y - cy) })),
+      bx: bw, bz: bh
+    })
+    selSet.clear(); selSet.add(parts.length - 1)
+  }
   /** 鉛筆の多角形を確定してパーツ化(2点なら長方形) */
   const closePen = (): void => {
-    if (penPts.length === 2) {
-      const [a, b] = penPts
-      penPts = [a, new THREE.Vector3(b.x, 0, a.z), b, new THREE.Vector3(a.x, 0, b.z)]
+    let poly = penPts
+    if (poly.length === 2) {
+      const [a, b] = poly
+      poly = [a, pt(b.x, a.y), b, pt(a.x, b.y)]
     }
-    if (penPts.length >= 3) {
-      const mm = penPts.map(v => ({ x: v.x / MM, y: v.z / MM }))
-      const xs = mm.map(q => q.x), ys = mm.map(q => q.y)
-      const cx = (Math.min(...xs) + Math.max(...xs)) / 2
-      const cy = (Math.min(...ys) + Math.max(...ys)) / 2
-      const bw = Math.max(10, Math.round(Math.max(...xs) - Math.min(...xs)))
-      const bh = Math.max(10, Math.round(Math.max(...ys) - Math.min(...ys)))
-      parts.push({
-        kind: 'poly', op: 'add',
-        x: Math.round(cx), y: 0, z: Math.round(cy),
-        sx: bw, sy: 400, sz: bh, rot: 0,
-        pts: mm.map(q => ({ x: Math.round(q.x - cx), y: Math.round(q.y - cy) })),
-        bx: bw, bz: bh
-      })
-      selSet.clear(); selSet.add(parts.length - 1)
-    }
+    makePolyPart(poly)
     setPenMode(false)
     refresh()
-  }
-  const updatePenLine = (hover: THREE.Vector3): void => {
-    penLine.geometry.setFromPoints([...penPts, hover])
-    penLine.visible = penPts.length > 0
-    render()
   }
 
   modal.querySelectorAll('[data-add]').forEach(b => {
@@ -602,16 +653,25 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
 
   renderer.domElement.addEventListener('pointerdown', e => {
     if (e.button !== 0 || previewing) return
-    // 鉛筆モード: 地面(y=0)クリックで頂点を追加。始点クリックで閉じる
+    // 鉛筆モード: 地面(y=0)クリックで頂点を追加(3D モードと同じスナップ・軸ロック)。
+    // 長方形モード(params.pencil.mode)は 2 点で確定、鉛筆は始点クリックで閉じる
     if (penMode) {
       e.stopPropagation()
-      ray.setFromCamera(ndc(e), camera)
-      const q = new THREE.Vector3()
-      if (!ray.ray.intersectPlane(groundPlane, q)) return
-      q.set(Math.round(q.x / MM / 10) * 10 * MM, 0, Math.round(q.z / MM / 10) * 10 * MM)
-      if (penPts.length >= 3 && q.distanceTo(penPts[0]) < 0.06) { closePen(); return }
-      penPts.push(q)
-      updatePenLine(q)
+      const pc = penCursor(e)
+      if (!pc) return
+      if (params.pencil.mode === 'rect') {
+        if (!penRectStart) {
+          penRectStart = pc.cur
+        } else {
+          const a = penRectStart
+          makePolyPart([a, pt(pc.cur.x, a.y), pc.cur, pt(a.x, pc.cur.y)])
+          setPenMode(false)
+          refresh()
+        }
+        return
+      }
+      if (penPts.length >= 3 && dist(pc.cur, penPts[0]) < 80) { closePen(); return }
+      penPts.push(pc.cur)
       return
     }
     try { renderer.domElement.setPointerCapture(e.pointerId) } catch { /* noop */ }
@@ -673,10 +733,15 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
 
   renderer.domElement.addEventListener('pointermove', e => {
     if (penMode) {
-      if (!penPts.length) return
-      ray.setFromCamera(ndc(e), camera)
-      const q = new THREE.Vector3()
-      if (ray.ray.intersectPlane(groundPlane, q)) updatePenLine(q)
+      const pc = penCursor(e)
+      if (pc) {
+        sketchOv.update({
+          camera, canvas: renderer.domElement,
+          cursor: pc.cur, y: 0, pts: penPts, rectStart: penRectStart,
+          snap: pc.snap, axis: pc.axis
+        })
+        render()
+      }
       return
     }
     if (ringDrag) {
@@ -830,6 +895,7 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
   // ---------- プレビュー・保存・終了 ----------
   const close = (): void => {
     window.removeEventListener('pointerup', winUp)
+    sketchOv.dispose()
     renderer.dispose()
     modal.remove()
   }

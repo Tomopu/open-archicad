@@ -125,7 +125,7 @@ export function netPolyArea(outer: Pt[], holes: Pt[][]): number {
 // 辺の集合から平面グラフを作り、最小閉路 = 面を求める(SketchUp 流)。
 // 辺は交点・他の辺の端点で自動分割されるので「辺の途中から線を引く」ことができる。
 
-const V_TOL = 2 // 頂点マージ許容 mm
+const V_TOL = 5 // 頂点マージ許容 mm(わずかに離れた端点でも閉路として面になる)
 
 /** 2線分の交差パラメータ(両線分の内部)。平行・端点接触は null */
 function segParams(a1: Pt, a2: Pt, b1: Pt, b2: Pt): { t: number; u: number } | null {

@@ -68,7 +68,7 @@ export interface Stair {
   width: number; treads: number; tread: number; riser: number; material?: string; color?: string; group?: string; hidden?: boolean; attach?: WallAttach
 }
 export interface Furniture { id: string; type: 'furniture'; pos: Pt; rot: number; kind: FurnKind; w: number; d: number; h: number; material?: string; color?: string; group?: string; hidden?: boolean; elev?: number; tiltX?: number; tiltZ?: number; attach?: WallAttach }
-export interface Equipment { id: string; type: 'equipment'; pos: Pt; rot: number; kind: EquipKind; group?: string; hidden?: boolean; attach?: WallAttach }
+export interface Equipment { id: string; type: 'equipment'; pos: Pt; rot: number; kind: EquipKind; w?: number; d?: number; group?: string; hidden?: boolean; attach?: WallAttach }
 export interface Column { id: string; type: 'column'; pos: Pt; rot: number; w: number; d: number; h: number; shape: 'rect' | 'round'; material?: string; color?: string; group?: string; hidden?: boolean; attach?: WallAttach }
 /** 寸法線の端点が従属しているスナップ点(壁の t 位置・部屋の頂点など)。対象が変形するとリアルタイム追従 */
 export interface DimAnchor { entId: string; t?: number; vi?: number; kind: 'wall' | 'roomV' | 'roomC' | 'center' }
@@ -107,7 +107,8 @@ export interface CustomE {
   attach?: WallAttach
 }
 
-export type Entity = Wall | Opening | Stair | Furniture | Equipment | Column | DimensionE | LabelE | Room | Planting | CustomE | SketchE
+/** dispName = オブジェクト一覧での表示名(ダブルクリックでリネーム) */
+export type Entity = (Wall | Opening | Stair | Furniture | Equipment | Column | DimensionE | LabelE | Room | Planting | CustomE | SketchE) & { dispName?: string }
 
 export interface ProjectMeta {
   title: string
@@ -115,6 +116,8 @@ export interface ProjectMeta {
   bcrLimit: number        // 指定建蔽率 %
   farLimit: number        // 指定容積率 %
   floors: number
+  /** グループの表示名(オブジェクト一覧でリネーム可能) */
+  groupNames?: Record<string, string>
 }
 
 /** 階(フロア)。図面は階ごとに独立して持つ。height=階高 mm(未設定は壁高から自動) */
@@ -159,6 +162,16 @@ export const EQUIP_LABEL: Record<EquipKind, string> = {
   boiler: '給湯器・ボイラー', ventfan: '換気扇(24h換気)', alarm: '住宅用火災警報器',
   ac_indoor: 'エアコン(室内)', ac_outdoor: 'エアコン(室外)', panel: '分電盤', heater: '電気温水器'
 }
+/** 設備記号の基準サイズ(リサイズはこの比率でスケール) */
+export const EQUIP_SIZE: Record<EquipKind, { w: number; d: number }> = {
+  boiler: { w: 600, d: 300 }, ventfan: { w: 300, d: 300 }, alarm: { w: 260, d: 260 },
+  ac_indoor: { w: 800, d: 250 }, ac_outdoor: { w: 800, d: 320 }, panel: { w: 500, d: 160 },
+  heater: { w: 600, d: 300 }
+}
+export const equipSize = (e: Equipment): { w: number; d: number } => ({
+  w: e.w ?? EQUIP_SIZE[e.kind].w,
+  d: e.d ?? EQUIP_SIZE[e.kind].d
+})
 export const OPENING_LABEL: Record<OpeningKind, string> = {
   door_single: '片開き戸', door_double: '両開き戸', door_sliding: '引違い戸',
   door_pocket: '片引き戸', door_folding: '折りたたみ戸',

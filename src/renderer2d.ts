@@ -1,7 +1,11 @@
 // 2D 図面レンダラー — 再描画は要求時のみ(requestAnimationFrame 1回)。無駄な計算をしない。
-import { Store, Wall, Opening, Entity } from './model'
-import { Pt, sub, norm, perp, lerp, bbox, distToSeg, polyContains, lineIntersect, dist } from './geometry'
+import { Store, Wall, Opening, Entity, isWindow, equipSize } from './model'
+import { Pt, pt, sub, norm, perp, lerp, bbox, distToSeg, polyContains, lineIntersect, dist } from './geometry'
 import * as sym from './symbols'
+
+export type ElevDir = 'front' | 'back' | 'left' | 'right'
+/** 立面図で使う壁 1 枚分の情報(階の床高さ mm 込み) */
+interface ElevWall { w: Wall; floorY: number; level: number }
 
 export class Viewport {
   zoom = 0.08          // px / mm
@@ -27,6 +31,8 @@ export class Renderer2D {
   showRefLine = true
   /** スケッチのサブ選択(面・閉路・辺)。ツール側から設定 */
   sketchSub: { id: string; mode: 'face' | 'loop' | 'edge'; faceIdx?: number; edgeIdx?: number } | null = null
+  /** 立面図モード(正面・背面・左右側面)。null = 平面図 */
+  elevation: { dir: ElevDir; cluster: number } | null = null
   /** 下階を透かして表示(2階以上で編集するときの位置合わせ用) */
   showGhost = true
   /** 壁厚の自動表記(t=120)を表示 */
@@ -55,6 +61,17 @@ export class Renderer2D {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
     ctx.fillStyle = '#ffffff'
     ctx.fillRect(0, 0, w, h)
+
+    // 立面図モード: 平面図の代わりに選択中の建物の立面を描く
+    if (this.elevation) {
+      if (this.showGrid) this.drawGrid(w, h)
+      ctx.save()
+      ctx.setTransform(dpr * vp.zoom, 0, 0, dpr * vp.zoom, -vp.view.x * vp.zoom * dpr, -vp.view.y * vp.zoom * dpr)
+      this.drawElevation()
+      ctx.restore()
+      if (this.onAfterDraw) this.onAfterDraw()
+      return
+    }
 
     if (this.showGrid) this.drawGrid(w, h)
 
@@ -231,12 +248,19 @@ export class Renderer2D {
       ctx.restore()
     }
   }
-  /** 端点 p が他の壁に接している場合、相手の厚みの半分(最大値)を返す。接していなければ 0 */
+  /** 端点 p が他の壁に接している場合の延長量。
+   *  相手の壁からはみ出さないよう交差角で制限(斜め壁が「勝手に伸びた」ように見えない) */
   private joinExt(p: Pt, self: Wall, walls: Wall[]): number {
+    const ds = norm(sub(self.b, self.a))
     let ext = 0
     for (const w of walls) {
-      if (w === self) continue
-      if (distToSeg(p, w.a, w.b) < w.thickness / 2 + 1) ext = Math.max(ext, w.thickness / 2)
+      if (w === self || distToSeg(p, w.a, w.b) >= w.thickness / 2 + 1) continue
+      const dw = norm(sub(w.b, w.a))
+      const c = Math.abs(ds.x * dw.y - ds.y * dw.x) // sin(交差角)
+      const k = Math.abs(ds.x * dw.x + ds.y * dw.y) // cos(交差角)
+      if (c <= 0.25) continue // ほぼ平行は延長しない
+      const safe = Math.max(0, (w.thickness / 2 - (self.thickness / 2) * k) / c)
+      ext = Math.max(ext, Math.min(w.thickness / 2, safe))
     }
     return ext
   }
@@ -283,6 +307,137 @@ export class Renderer2D {
     ctx.lineTo(aMinus.x, aMinus.y)
     ctx.closePath()
     ctx.fill()
+  }
+
+  // ---------------- 立面図(正面・背面・左右側面) ----------------
+  /**
+   * 建物クラスタ: 全階の壁を端点の接触でグループ化(複数棟の判定)。
+   * 各壁はその階の床高さ(mm)付き。
+   */
+  buildingClusters(): ElevWall[][] {
+    const all: ElevWall[] = []
+    let yBase = 0
+    this.store.doc.levels.forEach((level, li) => {
+      const floorY = yBase + 100 // スラブ上面(FLOOR_T = 100mm)
+      for (const e of level.entities) {
+        if (e.type === 'wall' && !e.hidden) all.push({ w: e, floorY, level: li })
+      }
+      const walls = level.entities.filter((e): e is Wall => e.type === 'wall')
+      yBase += level.height && level.height > 0
+        ? level.height
+        : Math.max(2400, ...walls.map(w => w.height)) + 100
+    })
+    // Union-Find で接触する壁をまとめる(XY 平面のみ。階をまたいでも同じ建物)
+    const parent = all.map((_, i) => i)
+    const find = (i: number): number => (parent[i] === i ? i : (parent[i] = find(parent[i])))
+    const union = (a: number, b: number): void => { parent[find(a)] = find(b) }
+    const touch = (a: Wall, b: Wall): boolean => {
+      const tol = (a.thickness + b.thickness) / 2 + 50
+      return [a.a, a.b].some(p => distToSeg(p, b.a, b.b) < tol) ||
+        [b.a, b.b].some(p => distToSeg(p, a.a, a.b) < tol)
+    }
+    for (let i = 0; i < all.length; i++) {
+      for (let j = i + 1; j < all.length; j++) {
+        if (touch(all[i].w, all[j].w)) union(i, j)
+      }
+    }
+    const groups = new Map<number, ElevWall[]>()
+    all.forEach((ew, i) => {
+      const r = find(i)
+      if (!groups.has(r)) groups.set(r, [])
+      groups.get(r)!.push(ew)
+    })
+    // 大きい順(まず母屋、次に離れなど)
+    return [...groups.values()].sort((a, b) => b.length - a.length)
+  }
+
+  /**
+   * 選択中の建物の立面図を描く(ワールド座標: x = 立面の横位置 mm / y = -高さ mm)。
+   * 奥の壁から手前の壁の順に白塗り+輪郭で描く簡易陰線処理。
+   */
+  private drawElevation(): void {
+    const { ctx, vp } = this
+    const elev = this.elevation!
+    const clusters = this.buildingClusters()
+    if (!clusters.length) {
+      ctx.fillStyle = '#9ca3af'
+      ctx.font = `${16 / vp.zoom}px sans-serif`
+      ctx.textAlign = 'center'
+      ctx.fillText('壁がありません(立面図は壁から生成されます)', vp.view.x + 4000, vp.view.y + 3000)
+      return
+    }
+    const walls = clusters[Math.min(elev.cluster, clusters.length - 1)]
+    // 視線方向: u = 画面右向きの平面ベクトル / v = 手前(視点)向き
+    const AX: Record<ElevDir, { u: Pt; v: Pt }> = {
+      front: { u: pt(1, 0), v: pt(0, 1) },    // 南から(平面図の下から)見る
+      back: { u: pt(-1, 0), v: pt(0, -1) },   // 北から
+      right: { u: pt(0, -1), v: pt(1, 0) },   // 東から(右側面)
+      left: { u: pt(0, 1), v: pt(-1, 0) }     // 西から(左側面)
+    }
+    const { u, v } = AX[elev.dir]
+    const U = (p: Pt): number => p.x * u.x + p.y * u.y
+    const D = (p: Pt): number => p.x * v.x + p.y * v.y
+    const openings = new Map<string, Opening[]>()
+    for (const level of this.store.doc.levels) {
+      for (const e of level.entities) {
+        if (e.type !== 'opening' || e.hidden) continue
+        const arr = openings.get(e.wallId) ?? []
+        arr.push(e)
+        openings.set(e.wallId, arr)
+      }
+    }
+    // 奥 → 手前の順(手前の壁が上に塗り重なる = 簡易陰線)
+    const sorted = [...walls].sort((a, b) =>
+      D(lerp(a.w.a, a.w.b, 0.5)) - D(lerp(b.w.a, b.w.b, 0.5)))
+    const INK = '#1f2937'
+    let minU = Infinity, maxU = -Infinity
+    for (const ew of sorted) { minU = Math.min(minU, U(ew.w.a), U(ew.w.b)); maxU = Math.max(maxU, U(ew.w.a), U(ew.w.b)) }
+    for (const ew of sorted) {
+      const { w } = ew
+      let ua = U(w.a), ub = U(w.b)
+      if (ua > ub) [ua, ub] = [ub, ua]
+      // 端から見た壁(視線と平行)は厚み分の細い帯として見える
+      if (ub - ua < w.thickness) { const c = (ua + ub) / 2; ua = c - w.thickness / 2; ub = c + w.thickness / 2 }
+      const y0 = -ew.floorY, y1 = -(ew.floorY + w.height)
+      ctx.fillStyle = '#fafafa'
+      ctx.strokeStyle = INK
+      ctx.lineWidth = 1.2 / vp.zoom
+      ctx.fillRect(ua, y1, ub - ua, y0 - y1)
+      ctx.strokeRect(ua, y1, ub - ua, y0 - y1)
+      // この壁に載っている建具(正対する壁のみ描く)
+      const facing = Math.abs((w.b.x - w.a.x) * u.x + (w.b.y - w.a.y) * u.y) /
+        Math.max(1, dist(w.a, w.b)) > 0.7
+      if (!facing) continue
+      for (const o of openings.get(w.id) ?? []) {
+        const cU = U(lerp(w.a, w.b, o.t))
+        const ox0 = cU - o.width / 2, ox1 = cU + o.width / 2
+        const sill = isWindow(o.kind) ? o.sill : 0
+        const oy0 = -(ew.floorY + sill), oy1 = -(ew.floorY + o.head)
+        ctx.fillStyle = isWindow(o.kind) ? '#eaf3fb' : '#f3ede2'
+        ctx.fillRect(ox0, oy1, ox1 - ox0, oy0 - oy1)
+        ctx.lineWidth = 1 / vp.zoom
+        ctx.strokeRect(ox0, oy1, ox1 - ox0, oy0 - oy1)
+        ctx.lineWidth = 0.6 / vp.zoom
+        if (isWindow(o.kind)) {
+          // 窓: 十字の桟
+          ctx.beginPath()
+          ctx.moveTo((ox0 + ox1) / 2, oy1); ctx.lineTo((ox0 + ox1) / 2, oy0)
+          ctx.moveTo(ox0, (oy0 + oy1) / 2); ctx.lineTo(ox1, (oy0 + oy1) / 2)
+          ctx.stroke()
+        } else {
+          // ドア: ノブ
+          ctx.beginPath()
+          ctx.arc(ox1 - 120, (oy0 + oy1) / 2, 40, 0, Math.PI * 2)
+          ctx.stroke()
+        }
+      }
+    }
+    // 地盤線(GL)
+    ctx.strokeStyle = INK
+    ctx.lineWidth = 2.2 / vp.zoom
+    ctx.beginPath()
+    ctx.moveTo(minU - 1200, 0); ctx.lineTo(maxU + 1200, 0)
+    ctx.stroke()
   }
 
   /** リーガルハイライト用に要素の実形状を塗る */
@@ -361,7 +516,10 @@ export class Renderer2D {
       case 'furniture': return this.rotBounds(e.pos, e.rot, -e.w / 2, -e.d / 2, e.w, e.d)
       case 'column': return this.rotBounds(e.pos, e.rot, -e.w / 2, -e.d / 2, e.w, e.d)
       case 'custom': return this.rotBounds(e.pos, e.rot, -e.w / 2, -e.d / 2, e.w, e.d)
-      case 'equipment': return { min: { x: e.pos.x - 450, y: e.pos.y - 250 }, max: { x: e.pos.x + 450, y: e.pos.y + 250 } }
+      case 'equipment': {
+        const s = equipSize(e)
+        return this.rotBounds(e.pos, e.rot, -s.w / 2, -s.d / 2, s.w, s.d)
+      }
       case 'planting': {
         const r = e.kind === 'tree' ? Math.max(400, e.height / 4) : e.kind === 'shrub' ? Math.max(250, e.height / 3) : 260
         return { min: { x: e.pos.x - r, y: e.pos.y - r }, max: { x: e.pos.x + r, y: e.pos.y + r } }
