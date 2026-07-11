@@ -1032,7 +1032,7 @@ function renderObjectList(): void {
 store.onChange(() => renderObjectList())
 function updateObjActions(): void {
   const ids = [...renderer.selection]
-  if (!ids.length) { objActions.hidden = true; return }
+  if (!ids.length || renderer.elevation) { objActions.hidden = true; return }
   // 消しゴムはスケッチの面を選択中のみ(選択が変わったら隠す)
   const sub = tm.sketchSub
   eraseBtn.hidden = !(sub && (sub.mode === 'face' || sub.mode === 'loop') &&
@@ -1157,7 +1157,7 @@ function updateDimChips(): void {
   // 入力中は再構築しない(フォーカスが失われるため)
   if (dimChips.contains(document.activeElement)) return
   const ids = [...renderer.selection]
-  if (ids.length !== 1 || !$('#view3d').hidden) { dimChips.hidden = true; chipsSig = ''; return }
+  if (ids.length !== 1 || !$('#view3d').hidden || renderer.elevation) { dimChips.hidden = true; chipsSig = ''; return }
   const e = store.byId(ids[0])
   if (!e) { dimChips.hidden = true; chipsSig = ''; return }
   const defs = chipDefs(e)
@@ -1518,6 +1518,8 @@ async function ensure3D(): Promise<View3D> {
     view3d.getSnapInfo = p => tm.snapInfo(p)   // 2D と同じスナップ・ガイドを 3D でも使う
     view3d.getDupAwait = () => tm.awaitingDupBase
     view3d.onDupBase3D = p => tm.pickDupBase(p)
+    view3d.getDrawMode = () => (tm.tool === 'room' ? params.room.mode : tm.tool === 'pencil' ? params.pencil.mode : null)
+    view3d.onToggleDrawMode = () => tm.toggleDrawMode()
     view3d.getPreviewEntity = p => {
       const t = tm.tool
       switch (t) {
@@ -1648,11 +1650,11 @@ async function applyViewPreset(v: string): Promise<void> {
     return
   }
   if (v.startsWith('elev-')) {
-    // 2D の立面図(正面・背面・左右側面)
+    // 2D の立面図(正面・背面・左右側面)。開いたとき建物を画面中央にフィット
     await switchTab('2d')
     renderer.elevation = { dir: v.slice(5) as 'front' | 'back' | 'left' | 'right', cluster: 0 }
     renderElevationChips()
-    renderer.requestDraw()
+    renderer.fitElevation()
     return
   }
   renderer.elevation = null
@@ -1670,14 +1672,15 @@ function renderElevationChips(): void {
   const dirLabel = { front: '正面図', back: '背面図', right: '右側面図', left: '左側面図' }[el.dir]
   const title = document.createElement('span')
   title.className = 'elev-title'
-  title.textContent = `${dirLabel}(閲覧専用)`
+  title.textContent = dirLabel
+  title.title = 'クリックで選択 / ドラッグで移動 / 壁の上端をドラッグで高さ変更 / 窓は上下ドラッグで窓台高'
   elevChips.appendChild(title)
   if (clusters.length > 1) {
     clusters.forEach((_, i) => {
       const b = document.createElement('button')
       b.textContent = `建物 ${i + 1}`
       b.classList.toggle('active', i === el.cluster)
-      b.onclick = () => { el.cluster = i; renderElevationChips(); renderer.requestDraw() }
+      b.onclick = () => { el.cluster = i; renderElevationChips(); renderer.fitElevation() }
       elevChips.appendChild(b)
     })
   }

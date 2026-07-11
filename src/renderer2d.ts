@@ -6,6 +6,25 @@ import * as sym from './symbols'
 export type ElevDir = 'front' | 'back' | 'left' | 'right'
 /** 立面図で使う壁 1 枚分の情報(階の床高さ mm 込み) */
 interface ElevWall { w: Wall; floorY: number; level: number }
+/** 立面図の視線方向: u = 画面右向きの平面ベクトル / v = 手前(視点)向き */
+export const elevAxis = (dir: ElevDir): { u: Pt; v: Pt } => ({
+  front: { u: pt(1, 0), v: pt(0, 1) },    // 南から(平面図の下から)見る
+  back: { u: pt(-1, 0), v: pt(0, -1) },   // 北から
+  right: { u: pt(0, -1), v: pt(1, 0) },   // 東から(右側面)
+  left: { u: pt(0, 1), v: pt(-1, 0) }     // 西から(左側面)
+}[dir])
+/** 立面図に投影した壁(座標: x = 立面の横位置 mm / y = -高さ mm) */
+export interface ElevWallProj {
+  w: Wall; level: number; floorY: number
+  ua: number; ub: number; y0: number; y1: number
+  /** 立面に正対しているか(建具を描く対象) */
+  facing: boolean
+  depth: number
+}
+export interface ElevOpenProj {
+  o: Opening; wall: ElevWallProj
+  x0: number; x1: number; y0: number; y1: number
+}
 
 export class Viewport {
   zoom = 0.08          // px / mm
@@ -351,85 +370,156 @@ export class Renderer2D {
     return [...groups.values()].sort((a, b) => b.length - a.length)
   }
 
+  /** 選択中の建物の壁を立面図へ投影(奥 → 手前の順)。編集(ヒットテスト・ドラッグ)と描画で共用 */
+  elevWalls(): ElevWallProj[] {
+    const elev = this.elevation
+    if (!elev) return []
+    const clusters = this.buildingClusters()
+    if (!clusters.length) return []
+    const walls = clusters[Math.min(elev.cluster, clusters.length - 1)]
+    const { u, v } = elevAxis(elev.dir)
+    const U = (p: Pt): number => p.x * u.x + p.y * u.y
+    const D = (p: Pt): number => p.x * v.x + p.y * v.y
+    const out: ElevWallProj[] = walls.map(ew => {
+      const { w } = ew
+      let ua = U(w.a), ub = U(w.b)
+      if (ua > ub) [ua, ub] = [ub, ua]
+      // 端から見た壁(視線と平行)は厚み分の細い帯として見える
+      if (ub - ua < w.thickness) { const c = (ua + ub) / 2; ua = c - w.thickness / 2; ub = c + w.thickness / 2 }
+      const facing = Math.abs((w.b.x - w.a.x) * u.x + (w.b.y - w.a.y) * u.y) /
+        Math.max(1, dist(w.a, w.b)) > 0.7
+      return {
+        w, level: ew.level, floorY: ew.floorY,
+        ua, ub,
+        // 壁はスラブ(100mm)を貫通して階の底まで届く = 1F は GL に接する
+        y0: -(ew.floorY - 100),
+        y1: -(ew.floorY + w.height),
+        facing,
+        depth: D(lerp(w.a, w.b, 0.5))
+      }
+    })
+    return out.sort((a, b) => a.depth - b.depth)
+  }
+  /** 正対する壁に載っている建具の投影 */
+  elevOpenings(): ElevOpenProj[] {
+    const elev = this.elevation
+    if (!elev) return []
+    const { u } = elevAxis(elev.dir)
+    const U = (p: Pt): number => p.x * u.x + p.y * u.y
+    const byWall = new Map<string, Opening[]>()
+    for (const level of this.store.doc.levels) {
+      for (const e of level.entities) {
+        if (e.type !== 'opening' || e.hidden) continue
+        const arr = byWall.get(e.wallId) ?? []
+        arr.push(e)
+        byWall.set(e.wallId, arr)
+      }
+    }
+    const out: ElevOpenProj[] = []
+    for (const wp of this.elevWalls()) {
+      if (!wp.facing) continue
+      for (const o of byWall.get(wp.w.id) ?? []) {
+        const cU = U(lerp(wp.w.a, wp.w.b, o.t))
+        const sill = isWindow(o.kind) ? o.sill : 0
+        out.push({
+          o, wall: wp,
+          x0: cU - o.width / 2, x1: cU + o.width / 2,
+          y0: -(wp.floorY + sill), y1: -(wp.floorY + o.head)
+        })
+      }
+    }
+    return out
+  }
+
+  /** 立面図を開いたとき、建物が画面中央に収まるようにフィット */
+  fitElevation(): void {
+    const walls = this.elevWalls()
+    if (!walls.length) return
+    let minU = Infinity, maxU = -Infinity, minY = Infinity
+    for (const w of walls) {
+      minU = Math.min(minU, w.ua); maxU = Math.max(maxU, w.ub)
+      minY = Math.min(minY, w.y1)
+    }
+    const w = Math.max(1000, maxU - minU)
+    const h = Math.max(1000, -minY)
+    const cw = this.canvas.clientWidth || 800, ch = this.canvas.clientHeight || 600
+    this.vp.zoom = Math.max(0.004, Math.min(3, Math.min(cw / (w * 1.35), ch / (h * 1.8))))
+    this.vp.view = {
+      x: (minU + maxU) / 2 - cw / (2 * this.vp.zoom),
+      y: (minY / 2) - ch / (2 * this.vp.zoom)
+    }
+    this.requestDraw()
+  }
+
   /**
    * 選択中の建物の立面図を描く(ワールド座標: x = 立面の横位置 mm / y = -高さ mm)。
-   * 奥の壁から手前の壁の順に白塗り+輪郭で描く簡易陰線処理。
+   * 奥の壁から手前の壁の順に白塗り+輪郭で描く簡易陰線処理。選択中はハイライト+上端に高さつまみ。
    */
   private drawElevation(): void {
     const { ctx, vp } = this
-    const elev = this.elevation!
-    const clusters = this.buildingClusters()
-    if (!clusters.length) {
+    const walls = this.elevWalls()
+    if (!walls.length) {
       ctx.fillStyle = '#9ca3af'
       ctx.font = `${16 / vp.zoom}px sans-serif`
       ctx.textAlign = 'center'
       ctx.fillText('壁がありません(立面図は壁から生成されます)', vp.view.x + 4000, vp.view.y + 3000)
       return
     }
-    const walls = clusters[Math.min(elev.cluster, clusters.length - 1)]
-    // 視線方向: u = 画面右向きの平面ベクトル / v = 手前(視点)向き
-    const AX: Record<ElevDir, { u: Pt; v: Pt }> = {
-      front: { u: pt(1, 0), v: pt(0, 1) },    // 南から(平面図の下から)見る
-      back: { u: pt(-1, 0), v: pt(0, -1) },   // 北から
-      right: { u: pt(0, -1), v: pt(1, 0) },   // 東から(右側面)
-      left: { u: pt(0, 1), v: pt(-1, 0) }     // 西から(左側面)
-    }
-    const { u, v } = AX[elev.dir]
-    const U = (p: Pt): number => p.x * u.x + p.y * u.y
-    const D = (p: Pt): number => p.x * v.x + p.y * v.y
-    const openings = new Map<string, Opening[]>()
-    for (const level of this.store.doc.levels) {
-      for (const e of level.entities) {
-        if (e.type !== 'opening' || e.hidden) continue
-        const arr = openings.get(e.wallId) ?? []
-        arr.push(e)
-        openings.set(e.wallId, arr)
-      }
-    }
-    // 奥 → 手前の順(手前の壁が上に塗り重なる = 簡易陰線)
-    const sorted = [...walls].sort((a, b) =>
-      D(lerp(a.w.a, a.w.b, 0.5)) - D(lerp(b.w.a, b.w.b, 0.5)))
+    const opens = this.elevOpenings()
     const INK = '#1f2937'
     let minU = Infinity, maxU = -Infinity
-    for (const ew of sorted) { minU = Math.min(minU, U(ew.w.a), U(ew.w.b)); maxU = Math.max(maxU, U(ew.w.a), U(ew.w.b)) }
-    for (const ew of sorted) {
-      const { w } = ew
-      let ua = U(w.a), ub = U(w.b)
-      if (ua > ub) [ua, ub] = [ub, ua]
-      // 端から見た壁(視線と平行)は厚み分の細い帯として見える
-      if (ub - ua < w.thickness) { const c = (ua + ub) / 2; ua = c - w.thickness / 2; ub = c + w.thickness / 2 }
-      const y0 = -ew.floorY, y1 = -(ew.floorY + w.height)
+    for (const wp of walls) { minU = Math.min(minU, wp.ua); maxU = Math.max(maxU, wp.ub) }
+    for (const wp of walls) {
       ctx.fillStyle = '#fafafa'
       ctx.strokeStyle = INK
       ctx.lineWidth = 1.2 / vp.zoom
-      ctx.fillRect(ua, y1, ub - ua, y0 - y1)
-      ctx.strokeRect(ua, y1, ub - ua, y0 - y1)
-      // この壁に載っている建具(正対する壁のみ描く)
-      const facing = Math.abs((w.b.x - w.a.x) * u.x + (w.b.y - w.a.y) * u.y) /
-        Math.max(1, dist(w.a, w.b)) > 0.7
-      if (!facing) continue
-      for (const o of openings.get(w.id) ?? []) {
-        const cU = U(lerp(w.a, w.b, o.t))
-        const ox0 = cU - o.width / 2, ox1 = cU + o.width / 2
-        const sill = isWindow(o.kind) ? o.sill : 0
-        const oy0 = -(ew.floorY + sill), oy1 = -(ew.floorY + o.head)
+      ctx.fillRect(wp.ua, wp.y1, wp.ub - wp.ua, wp.y0 - wp.y1)
+      ctx.strokeRect(wp.ua, wp.y1, wp.ub - wp.ua, wp.y0 - wp.y1)
+      // この壁の建具
+      for (const op of opens) {
+        if (op.wall.w.id !== wp.w.id) continue
+        const { o } = op
         ctx.fillStyle = isWindow(o.kind) ? '#eaf3fb' : '#f3ede2'
-        ctx.fillRect(ox0, oy1, ox1 - ox0, oy0 - oy1)
+        ctx.fillRect(op.x0, op.y1, op.x1 - op.x0, op.y0 - op.y1)
         ctx.lineWidth = 1 / vp.zoom
-        ctx.strokeRect(ox0, oy1, ox1 - ox0, oy0 - oy1)
+        ctx.strokeRect(op.x0, op.y1, op.x1 - op.x0, op.y0 - op.y1)
         ctx.lineWidth = 0.6 / vp.zoom
         if (isWindow(o.kind)) {
-          // 窓: 十字の桟
           ctx.beginPath()
-          ctx.moveTo((ox0 + ox1) / 2, oy1); ctx.lineTo((ox0 + ox1) / 2, oy0)
-          ctx.moveTo(ox0, (oy0 + oy1) / 2); ctx.lineTo(ox1, (oy0 + oy1) / 2)
+          ctx.moveTo((op.x0 + op.x1) / 2, op.y1); ctx.lineTo((op.x0 + op.x1) / 2, op.y0)
+          ctx.moveTo(op.x0, (op.y0 + op.y1) / 2); ctx.lineTo(op.x1, (op.y0 + op.y1) / 2)
           ctx.stroke()
         } else {
-          // ドア: ノブ
           ctx.beginPath()
-          ctx.arc(ox1 - 120, (oy0 + oy1) / 2, 40, 0, Math.PI * 2)
+          ctx.arc(op.x1 - 120, (op.y0 + op.y1) / 2, 40, 0, Math.PI * 2)
           ctx.stroke()
         }
+        if (this.selection.has(o.id)) {
+          ctx.save()
+          ctx.strokeStyle = '#2563eb'
+          ctx.lineWidth = 1.8 / vp.zoom
+          ctx.setLineDash([120, 80])
+          ctx.strokeRect(op.x0, op.y1, op.x1 - op.x0, op.y0 - op.y1)
+          ctx.setLineDash([])
+          ctx.restore()
+        }
+      }
+      // 選択ハイライト + 上端の高さつまみ
+      if (this.selection.has(wp.w.id)) {
+        ctx.save()
+        ctx.strokeStyle = '#2563eb'
+        ctx.lineWidth = 1.8 / vp.zoom
+        ctx.setLineDash([120, 80])
+        ctx.strokeRect(wp.ua, wp.y1, wp.ub - wp.ua, wp.y0 - wp.y1)
+        ctx.setLineDash([])
+        const hs = 5.5 / vp.zoom
+        ctx.fillStyle = '#2563eb'
+        ctx.strokeStyle = '#ffffff'
+        ctx.lineWidth = 1.6 / vp.zoom
+        ctx.beginPath()
+        ctx.rect((wp.ua + wp.ub) / 2 - hs, wp.y1 - hs, hs * 2, hs * 2)
+        ctx.fill(); ctx.stroke()
+        ctx.restore()
       }
     }
     // 地盤線(GL)

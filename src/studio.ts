@@ -42,13 +42,19 @@ function partGeometry(p: StudioPart): THREE.BufferGeometry {
     case 'sphere': g = new THREE.SphereGeometry(p.sx / 2, 20, 14).scale(1, p.sy / p.sx, p.sz / p.sx); break
     case 'cone': g = new THREE.ConeGeometry(p.sx / 2, p.sy, 20); break
     case 'poly': {
-      // 鉛筆で描いた平面形状の押し出し(plan y → +z)
+      // 鉛筆で描いた平面形状(plan y → +z)。高さ 0 = 厚さのない平面、> 0 で押し出し
       const pts = p.pts ?? []
       const shape = new THREE.Shape(pts.map(q => new THREE.Vector2(q.x, -q.y)))
-      g = new THREE.ExtrudeGeometry(shape, { depth: p.sy, bevelEnabled: false })
-      g.rotateX(-Math.PI / 2)
-      g.scale(p.sx / (p.bx ?? p.sx), 1, p.sz / (p.bz ?? p.sz))
-      g.translate(0, -p.sy / 2, 0) // 中心原点に合わせる
+      if (p.sy < 1) {
+        g = new THREE.ShapeGeometry(shape)
+        g.rotateX(-Math.PI / 2)
+        g.scale(p.sx / (p.bx ?? p.sx), 1, p.sz / (p.bz ?? p.sz))
+      } else {
+        g = new THREE.ExtrudeGeometry(shape, { depth: p.sy, bevelEnabled: false })
+        g.rotateX(-Math.PI / 2)
+        g.scale(p.sx / (p.bx ?? p.sx), 1, p.sz / (p.bz ?? p.sz))
+        g.translate(0, -p.sy / 2, 0) // 中心原点に合わせる
+      }
       break
     }
     case 'baked': {
@@ -71,7 +77,9 @@ function csgOf(parts: StudioPart[], mode: 'recipe' | 'union' | 'subtract' | 'int
   const ev = new Evaluator()
   let acc: Brush | null = null
   for (const p of parts) {
-    const brush = new Brush(partGeometry(p))
+    // 厚さ 0 の平面はそのままではブール演算できないため、演算時のみ 2mm の薄板にする
+    const geoPart = p.kind === 'poly' && p.sy < 1 ? { ...p, sy: 2 } : p
+    const brush = new Brush(partGeometry(geoPart))
     brush.updateMatrixWorld()
     if (!acc) {
       if (mode !== 'recipe' || p.op === 'add') acc = brush
@@ -213,10 +221,11 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
   const gizmo = new THREE.Group()
   scene.add(partsGroup, resultGroup, gizmo)
 
-  const MAT_ADD = new THREE.MeshLambertMaterial({ color: 0xd4d4d8 })
-  const MAT_SUB = new THREE.MeshLambertMaterial({ color: 0xef4444, transparent: true, opacity: 0.45 })
-  const MAT_SEL = new THREE.MeshLambertMaterial({ color: 0x93b4f8, emissive: 0x1d4ed8, emissiveIntensity: 0.2 })
-  const MAT_RESULT = new THREE.MeshLambertMaterial({ color: 0xd4b896 })
+  // DoubleSide: 厚さ 0 の平面(鉛筆)も裏から見える
+  const MAT_ADD = new THREE.MeshLambertMaterial({ color: 0xd4d4d8, side: THREE.DoubleSide })
+  const MAT_SUB = new THREE.MeshLambertMaterial({ color: 0xef4444, transparent: true, opacity: 0.45, side: THREE.DoubleSide })
+  const MAT_SEL = new THREE.MeshLambertMaterial({ color: 0x93b4f8, emissive: 0x1d4ed8, emissiveIntensity: 0.2, side: THREE.DoubleSide })
+  const MAT_RESULT = new THREE.MeshLambertMaterial({ color: 0xd4b896, side: THREE.DoubleSide })
 
   // ---------- 状態 ----------
   const initParts = Array.isArray(initial?.parts) ? (initial!.parts as StudioPart[]) : null
@@ -233,6 +242,11 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
   let penPts: Pt[] = []                 // mm(平面)
   let penRectStart: Pt | null = null
   const sketchOv = new SketchOverlay(viewEl, MM)
+  sketchOv.onModeToggle = () => {
+    params.pencil.mode = params.pencil.mode === 'rect' ? 'poly' : 'rect'
+    penPts = []
+    penRectStart = null
+  }
   scene.add(sketchOv.group)
   const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0)
   /** クリック位置 → 平面 mm 座標 */
@@ -562,7 +576,7 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
     parts.push({
       kind: 'poly', op: 'add',
       x: Math.round(cx), y: 0, z: Math.round(cy),
-      sx: bw, sy: 400, sz: bh, rot: 0,
+      sx: bw, sy: 0, sz: bh, rot: 0, // 厚さ 0 の平面(高さつまみ・プロパティで押し出せる)
       pts: poly.map(q => ({ x: Math.round(q.x - cx), y: Math.round(q.y - cy) })),
       bx: bw, bz: bh
     })
@@ -738,7 +752,7 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
         sketchOv.update({
           camera, canvas: renderer.domElement,
           cursor: pc.cur, y: 0, pts: penPts, rectStart: penRectStart,
-          snap: pc.snap, axis: pc.axis
+          snap: pc.snap, axis: pc.axis, mode: params.pencil.mode
         })
         render()
       }

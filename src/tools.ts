@@ -3,7 +3,7 @@ import {
   Store, Entity, Wall, Opening, SketchE, uid, OpeningKind, StairKind, FurnKind, EquipKind, PlantKind,
   FURN_DEFAULTS, isWindow, Room, RoomUse, DimAnchor, equipSize
 } from './model'
-import { Renderer2D } from './renderer2d'
+import { Renderer2D, elevAxis } from './renderer2d'
 import {
   Pt, pt, sub, add, dist, distToSeg, projT, lerp, snapTo, pointInPoly, norm, perp, polyArea, rotate,
   arcThrough, angleDetentDeg, lineIntersect, polyCentroid, sketchFaces, faceKey, faceInfo
@@ -519,7 +519,7 @@ export class ToolManager {
       return
     }
     if (e.button !== 0) return
-    if (this.r.elevation) return // 立面図は閲覧専用(パン・ズームのみ)
+    if (this.r.elevation) { this.elevDown(p); return } // 立面図: 選択・ドラッグ編集
     // カーソル上のモード切替アイコン(鉛筆 / 長方形)のクリック
     if ((this.tool === 'room' || this.tool === 'pencil') && !this.rectStart && !this.penPts.length && !this.roomPts.length) {
       for (const ic of this.modeIcons) {
@@ -611,6 +611,12 @@ export class ToolManager {
         x: this.panView.x - (e.clientX - this.panStart.x) / z,
         y: this.panView.y - (e.clientY - this.panStart.y) / z
       }
+      this.r.requestDraw()
+      return
+    }
+    // 立面図: ドラッグ編集のみ(スナップ・オーバーレイは平面用なのでスキップ)
+    if (this.r.elevation) {
+      if (this.elevDrag && (e.buttons & 1)) this.elevMove(p)
       this.r.requestDraw()
       return
     }
@@ -746,6 +752,7 @@ export class ToolManager {
     this.dragging = false
     this.stairAdjust = null
     this.lastMagnet = null
+    this.elevDrag = null
     if (this.drillPending) {
       this.r.selection.clear()
       this.r.selection.add(this.drillPending)
@@ -869,6 +876,16 @@ export class ToolManager {
     this.dupFrom = base
     this.canvas.style.cursor = ''
     this.onDupBase(base)
+  }
+
+  /** 鉛筆 ⇄ 長方形のモード切替(2D のカーソルアイコン・3D のアイコン共通) */
+  toggleDrawMode(): void {
+    if (this.tool !== 'room' && this.tool !== 'pencil') return
+    const pr = this.tool === 'room' ? params.room : params.pencil
+    pr.mode = pr.mode === 'rect' ? 'poly' : 'rect'
+    this.updateHint()
+    this.onToolChange(this.tool)
+    this.r.requestDraw()
   }
 
   /** 数値入力バッファ(部屋・鉛筆の寸法指定)を確定 */
@@ -1089,6 +1106,102 @@ export class ToolManager {
   magnetizeById(id: string): void {
     const ent = this.store.byId(id)
     if (ent) this.magnetizeEntity(ent)
+  }
+
+  // ---------- 立面図の編集(選択・水平移動・高さ・建具の位置/窓台高) ----------
+  private elevDrag: {
+    kind: 'wallU' | 'wallH' | 'open'
+    id: string
+    startX: number
+    floorY: number
+    origA?: Pt; origB?: Pt
+    /** 建具ドラッグ用: 壁の両端の立面 U 座標 */
+    uA?: number; uB?: number
+  } | null = null
+
+  private elevDown(p: Pt): void {
+    const tol = 10 / this.r.vp.zoom
+    // 建具を優先(手前の壁から)
+    const opens = this.r.elevOpenings()
+    for (let i = opens.length - 1; i >= 0; i--) {
+      const op = opens[i]
+      if (p.x >= op.x0 - tol && p.x <= op.x1 + tol && p.y >= op.y1 - tol && p.y <= op.y0 + tol) {
+        this.r.selection.clear()
+        this.r.selection.add(op.o.id)
+        this.store.commit()
+        const { u } = elevAxis(this.r.elevation!.dir)
+        const U = (q: Pt): number => q.x * u.x + q.y * u.y
+        this.elevDrag = {
+          kind: 'open', id: op.o.id, startX: p.x, floorY: op.wall.floorY,
+          uA: U(op.wall.w.a), uB: U(op.wall.w.b)
+        }
+        this.onSelectionChange()
+        this.r.requestDraw()
+        return
+      }
+    }
+    // 壁(手前 = 後に描かれたものを優先)
+    const walls = this.r.elevWalls()
+    for (let i = walls.length - 1; i >= 0; i--) {
+      const wp = walls[i]
+      const inX = p.x >= wp.ua - tol && p.x <= wp.ub + tol
+      if (!inX) continue
+      // 上端: 高さドラッグ
+      if (Math.abs(p.y - wp.y1) < tol) {
+        this.r.selection.clear()
+        this.r.selection.add(wp.w.id)
+        this.store.commit()
+        this.elevDrag = { kind: 'wallH', id: wp.w.id, startX: p.x, floorY: wp.floorY }
+        this.onSelectionChange()
+        this.r.requestDraw()
+        return
+      }
+      if (p.y >= wp.y1 && p.y <= wp.y0 + tol) {
+        this.r.selection.clear()
+        this.r.selection.add(wp.w.id)
+        this.store.commit()
+        this.elevDrag = { kind: 'wallU', id: wp.w.id, startX: p.x, floorY: wp.floorY, origA: { ...wp.w.a }, origB: { ...wp.w.b } }
+        this.onSelectionChange()
+        this.r.requestDraw()
+        return
+      }
+    }
+    this.r.selection.clear()
+    this.onSelectionChange()
+    this.r.requestDraw()
+  }
+
+  private elevMove(p: Pt): void {
+    const d = this.elevDrag
+    if (!d || !this.r.elevation) return
+    const ent = this.store.byId(d.id)
+    if (!ent) return
+    const { u } = elevAxis(this.r.elevation.dir)
+    if (ent.type === 'wall' && d.kind === 'wallU' && d.origA && d.origB) {
+      // 立面の横方向 = 平面の u 方向へ平行移動
+      const du = snapTo(p.x - d.startX, this.snapStep)
+      ent.a = add(d.origA, pt(u.x * du, u.y * du))
+      ent.b = add(d.origB, pt(u.x * du, u.y * du))
+    } else if (ent.type === 'wall' && d.kind === 'wallH') {
+      ent.height = Math.max(300, snapTo(-p.y - d.floorY, 50))
+    } else if (ent.type === 'opening') {
+      const wall = this.store.byId(ent.wallId)
+      if (wall?.type !== 'wall' || d.uA === undefined || d.uB === undefined || d.uA === d.uB) return
+      const L = Math.max(1, dist(wall.a, wall.b))
+      const half = Math.min(0.5, ent.width / (2 * L))
+      const t = (p.x - d.uA) / (d.uB - d.uA)
+      ent.t = Math.min(Math.max(t, half), 1 - half)
+      if (isWindow(ent.kind)) {
+        // 上下ドラッグで窓台高
+        const winH = ent.head - ent.sill
+        let sill = snapTo(-p.y - d.floorY - winH / 2, 50)
+        sill = Math.min(Math.max(0, sill), Math.max(0, wall.height - winH))
+        ent.sill = sill
+        ent.head = sill + winH
+      }
+    }
+    this.store.emit()
+    this.onSelectionChange()
   }
 
   /** 選択要素(なければ配置プレビュー)を 90° 回転。建具は内外反転として扱う */

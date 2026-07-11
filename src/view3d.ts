@@ -318,6 +318,9 @@ export class View3D {
   /** 基準点複写: 基準点の選択待ちか / 基準点が picked されたとき */
   getDupAwait: () => boolean = () => false
   onDupBase3D: (p: Pt) => void = () => {}
+  /** 鉛筆 / 長方形モード(2D と共有)。null = アイコン非表示 */
+  getDrawMode: () => 'poly' | 'rect' | null = () => null
+  onToggleDrawMode: () => void = () => {}
   /** 共通の作図オーバーレイ(十字カーソル・ライブ線・ガイド・青寸法) */
   private sketchOv: SketchOverlay
   /** 直近の作図カーソル(スナップ・軸ロック済み)。クリック配置に使う */
@@ -397,6 +400,7 @@ export class View3D {
 
     // 共通の作図オーバーレイ(鉛筆・部屋・計測)
     this.sketchOv = new SketchOverlay(container, M)
+    this.sketchOv.onModeToggle = () => this.onToggleDrawMode()
     this.scene.add(this.sketchOv.group)
     this.measureLive = new THREE.Line(
       new THREE.BufferGeometry(),
@@ -1422,7 +1426,8 @@ export class View3D {
         this.lastPlanPoint = cur
         this.sketchOv.update({
           camera: this.camera, canvas: this.renderer.domElement,
-          cursor: cur, y: yBase, pts, rectStart, snap, axis
+          cursor: cur, y: yBase, pts, rectStart, snap, axis,
+          mode: tool === 'dimension' ? null : this.getDrawMode()
         })
       }
     } else if (info) {
