@@ -7,7 +7,8 @@ import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js'
 import { Store, Wall, Opening, Entity, SketchE, isWindow, MATERIALS, TexKind, FURN_DEFAULTS, EQUIP_SIZE, equipSize } from './model'
 import {
   Pt, pt, sub, norm, dist, distToSeg, snapTo, angleDetentDeg,
-  sketchFaces, faceNesting, faceInfo, faceKey, polyCentroid
+  sketchFaces, faceNesting, faceInfo, faceKey, polyCentroid,
+  CURSOR_PENCIL, CURSOR_HAND
 } from './geometry'
 import { SketchOverlay, axisLock, SnapInfo } from './sketchInput'
 
@@ -325,6 +326,10 @@ export class View3D {
   getComponentDef: () => Entity[] | null = () => null
   getPlaceRot: () => number = () => 0
   private ghostDefRef: unknown = null
+  /** 3D 上のカーソル(スナップ済み)を 2D 側へ共有(数値入力の方向決定) */
+  onPlanCursor: (p: Pt) => void = () => {}
+  /** 数値入力バッファ(青ラベルで表示) */
+  getNumBuf: () => string = () => ''
   /** 共通の作図オーバーレイ(十字カーソル・ライブ線・ガイド・青寸法) */
   private sketchOv: SketchOverlay
   /** 直近の作図カーソル(スナップ・軸ロック済み)。クリック配置に使う */
@@ -827,9 +832,23 @@ export class View3D {
     return pt(p.x * 1000, p.z * 1000)
   }
 
-  /** 選択ツール中: 左ドラッグ = 範囲選択、回転は右ドラッグへ(その他のツールは左 = 回転) */
+  /** Space 押下中 = 視点操作モード(手のカーソル・左ドラッグで回転)。2D・スタジオと共通の操作系 */
+  private spaceOn = false
+  setSpace(on: boolean): void {
+    if (this.spaceOn === on) return
+    this.spaceOn = on
+    this.syncControlButtons()
+    this.applyToolCursor()
+  }
+  /** ツール・Space に応じたカーソル(手 / 鉛筆 / 既定) */
+  private applyToolCursor(): void {
+    this.renderer.domElement.style.cursor = this.spaceOn ? CURSOR_HAND
+      : this.getTool() === 'pencil' ? CURSOR_PENCIL
+      : this.getDupAwait() ? 'crosshair' : ''
+  }
+  /** 選択ツール中: 左ドラッグ = 範囲選択、回転は右ドラッグへ(Space 中・他ツールは左 = 回転) */
   private syncControlButtons(): void {
-    const sel = this.getTool() === 'select'
+    const sel = this.getTool() === 'select' && !this.spaceOn
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     ;(this.controls as any).mouseButtons = sel
       ? { LEFT: null, MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.ROTATE }
@@ -838,6 +857,11 @@ export class View3D {
 
   private pointerDown(e: PointerEvent): void {
     if (e.button !== 0 || !this.store) {
+      this.syncControlButtons()
+      return
+    }
+    // Space 中は視点操作に専念(選択・作図・ギズモを触らない)
+    if (this.spaceOn) {
       this.syncControlButtons()
       return
     }
@@ -1255,12 +1279,12 @@ export class View3D {
     if (!this.dragging || !this.store) {
       if (!this.dragging && !this.heightDrag && !this.gizmoDrag && !this.openingDrag) {
         this.updatePreview(e)
-        // つまみの上では OS の「つかむ手」カーソルに
-        if (this.gizmo.children.length) {
-          const over = this.ray(e).intersectObjects(this.gizmo.children, true).length > 0
-          this.renderer.domElement.style.cursor = over ? 'grab' : ''
-        } else if (this.renderer.domElement.style.cursor === 'grab') {
-          this.renderer.domElement.style.cursor = ''
+        // つまみの上では OS の「つかむ手」カーソル、それ以外はツール別カーソル
+        if (!this.spaceOn && this.gizmo.children.length &&
+          this.ray(e).intersectObjects(this.gizmo.children, true).length > 0) {
+          this.renderer.domElement.style.cursor = 'grab'
+        } else {
+          this.applyToolCursor()
         }
       }
       return
@@ -1562,10 +1586,13 @@ export class View3D {
           axis = al.axis
         }
         this.lastPlanPoint = cur
+        this.onPlanCursor(cur) // 数値入力(長さ指定)の方向に使う
+        const nb = this.getNumBuf()
         this.sketchOv.update({
           camera: this.camera, canvas: this.renderer.domElement,
           cursor: cur, y: yBase, pts, rectStart, snap, axis,
-          mode: tool === 'dimension' ? null : this.getDrawMode()
+          mode: tool === 'dimension' ? null : this.getDrawMode(),
+          dims: nb ? [{ text: `${nb} ⏎`, at: cur }] : undefined
         })
       }
     } else if (tool === 'component' && this.getComponentDef()) {

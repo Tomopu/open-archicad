@@ -6,7 +6,8 @@ import {
 import { Renderer2D, elevAxis, ElevWallProj } from './renderer2d'
 import {
   Pt, pt, sub, add, dist, distToSeg, projT, lerp, snapTo, pointInPoly, norm, perp, polyArea, rotate,
-  arcThrough, angleDetentDeg, lineIntersect, polyCentroid, sketchFaces, faceKey, faceInfo, strokePerpGuide
+  arcThrough, angleDetentDeg, lineIntersect, polyCentroid, sketchFaces, faceKey, faceInfo, strokePerpGuide,
+  CURSOR_PENCIL, CURSOR_HAND
 } from './geometry'
 import {
   drawOpening, drawFurniture, drawStair, drawEquipment, drawPlanting, drawColumn,
@@ -96,6 +97,8 @@ export class ToolManager {
   private handleDrag: { entId: string; key: string } | null = null
   /** 複数選択のメンバー再クリック: 動かさなければ単体に絞る */
   private drillPending: string | null = null
+  /** スケッチ再クリック: 動かさなければ up で選択サイクルを進める */
+  private sketchCyclePend: { ent: SketchE; p: Pt } | null = null
   /** 建具配置時の反転状態(R / F で切替) */
   placeFlip = false
   placeSwap = false
@@ -114,6 +117,10 @@ export class ToolManager {
     const sp = this.snapPoint(p)
     return { p: sp, kind: this.snapKind, guides: [...this.snapGuides] }
   }
+  /** 3D ビューのカーソル位置を共有(数値入力の方向決定に使う) */
+  setCursorHint(p: Pt): void { this.cursor = p }
+  /** 数値入力バッファ(3D 側での表示用) */
+  get numBuffer(): string { return this.numBuf }
   private panning = false
   private panStart: Pt = pt(0, 0)
   private panView: Pt = pt(0, 0)
@@ -251,14 +258,16 @@ export class ToolManager {
     this.rectStart = null; this.penPts = []; this.penTarget = null; this.numBuf = ''
     if (t !== 'component') { this.placingComponent = null; this.dupFrom = null; this.dupAwaitBase = false }
     this.setSketchSub(null)
+    this.sketchLocked = false
     this.onToolChange(t)
     this.updateHint()
+    this.updateCursor()
     this.r.requestDraw()
   }
 
   private updateHint(): void {
     const hints: Record<ToolName, string> = {
-      select: 'クリック: 選択(スケッチは再クリックで 面→閉路→辺 と絞り込み) / ドラッグ: 移動 / Delete: 削除 / R: 回転',
+      select: 'クリック: 面→閉路→全体(以降ロック)。閉路中は辺クリックでその辺だけ / Space+ドラッグ: 視点移動 / Delete: 削除 / R: 回転',
       wall: 'クリックで始点→終点(連続入力) / ツール設定の「円弧壁」で 3点目=通過点の弧 / Shift: 直交 / 右クリック: 終了',
       column: 'クリックで柱を配置 / R: 90°回転',
       door: '壁の上でクリックしてドアを配置 / R・F: 内外反転 / G: 吊元切替',
@@ -464,38 +473,51 @@ export class ToolManager {
   get sketchSub(): { id: string; mode: 'face' | 'loop' | 'edge'; faceIdx?: number; edgeIdx?: number } | null {
     return this.r.sketchSub
   }
-  private cycleSketchSub(e: SketchE, p: Pt): void {
-    const cur = this.r.sketchSub?.id === e.id ? this.r.sketchSub : null
+  /** 全体選択のロック(4 回目以降のクリックで選択が切り替わらない) */
+  private sketchLocked = false
+  private faceIdxAt(e: SketchE, p: Pt): number {
+    // クリック位置を含む最小の面(入れ子は内側を優先)
     const faces = sketchFaces(e)
-    const faceIdx = ((): number => {
-      // クリック位置を含む最小の面(入れ子は内側を優先)
-      let best = -1, bestArea = Infinity
-      faces.forEach((f, i) => {
-        if (!pointInPoly(p, f)) return
-        const a = Math.abs(polyArea(f))
-        if (a < bestArea) { bestArea = a; best = i }
-      })
-      return best
-    })()
-    const edgeIdx = ((): number => {
-      let best = -1, bd = 20 / this.r.vp.zoom + 40
-      e.edges.forEach((ed, i) => {
-        const d = distToSeg(p, ed.a, ed.b)
-        if (d < bd) { bd = d; best = i }
-      })
-      return best
-    })()
-    // 全体 → 面 → 閉路 → 辺 → 全体(面がなければ 全体 → 辺 → 全体)
-    if (!cur) {
-      if (faceIdx >= 0) this.setSketchSub({ id: e.id, mode: 'face', faceIdx })
-      else if (edgeIdx >= 0) this.setSketchSub({ id: e.id, mode: 'edge', edgeIdx })
-    } else if (cur.mode === 'face') {
+    let best = -1, bestArea = Infinity
+    faces.forEach((f, i) => {
+      if (!pointInPoly(p, f)) return
+      const a = Math.abs(polyArea(f))
+      if (a < bestArea) { bestArea = a; best = i }
+    })
+    return best
+  }
+  private edgeIdxAt(e: SketchE, p: Pt): number {
+    let best = -1, bd = 20 / this.r.vp.zoom + 40
+    e.edges.forEach((ed, i) => {
+      const d = distToSeg(p, ed.a, ed.b)
+      if (d < bd) { bd = d; best = i }
+    })
+    return best
+  }
+  /** 初回選択: 1 回目のクリックで「面」を選択(面がなければ辺 → 全体) */
+  private initialSketchSub(e: SketchE, p: Pt): void {
+    this.sketchLocked = false
+    const fi = this.faceIdxAt(e, p)
+    if (fi >= 0) { this.setSketchSub({ id: e.id, mode: 'face', faceIdx: fi }); return }
+    const ei = this.edgeIdxAt(e, p)
+    if (ei >= 0) this.setSketchSub({ id: e.id, mode: 'edge', edgeIdx: ei })
+    else this.setSketchSub(null)
+  }
+  /** 再クリック(静止時)のサイクル: 面 → 閉路の辺 → 全体 → ロック。
+   *  閉路選択中に辺の上でクリックするとその辺だけを選択 */
+  private cycleSketchSub(e: SketchE, p: Pt): void {
+    if (this.sketchLocked) return
+    const cur = this.r.sketchSub?.id === e.id ? this.r.sketchSub : null
+    if (!cur) { this.initialSketchSub(e, p); this.r.requestDraw(); return }
+    if (cur.mode === 'face') {
       this.setSketchSub({ id: e.id, mode: 'loop', faceIdx: cur.faceIdx })
     } else if (cur.mode === 'loop') {
-      if (edgeIdx >= 0) this.setSketchSub({ id: e.id, mode: 'edge', edgeIdx })
-      else this.setSketchSub(null)
+      const ei = this.edgeIdxAt(e, p)
+      if (ei >= 0) this.setSketchSub({ id: e.id, mode: 'edge', edgeIdx: ei })
+      else { this.setSketchSub(null); this.sketchLocked = true } // 全体(以降ロック)
     } else {
       this.setSketchSub(null)
+      this.sketchLocked = true
     }
     this.r.requestDraw()
   }
@@ -580,16 +602,15 @@ export class ToolManager {
           if (!this.r.selection.has(hit.id)) {
             if (!e.shiftKey) this.r.selection.clear()
             this.r.selection.add(hit.id)
-            this.setSketchSub(null)
+            // スケッチは 1 回目のクリックで「面」を選択
+            if (hit.type === 'sketch' && !e.shiftKey) this.initialSketchSub(hit, p)
+            else { this.setSketchSub(null); this.sketchLocked = false }
             this.store.expandGroups(this.r.selection) // グループはまとめて選択
           } else if (e.shiftKey) {
             this.r.selection.delete(hit.id)
           } else if (this.r.selection.size === 1 && hit.type === 'sketch') {
-            // スケッチの再クリック: 全体 → 面 → 閉路 → 辺 と選択を絞り込む
-            this.cycleSketchSub(hit, p)
-            this.onSelectionChange()
-            this.r.requestDraw()
-            return
+            // スケッチの再クリック: 動かさなければ up で 面 → 閉路 → 全体 → ロック と進める
+            this.sketchCyclePend = { ent: hit, p }
           } else if (this.r.selection.size > 1) {
             // 複数選択のメンバー再クリック: ドラッグ=全体移動 / クリックだけなら単体に絞る(up で判定)
             this.drillPending = hit.id
@@ -604,7 +625,7 @@ export class ToolManager {
           this.store.commit()
         } else {
           // 何もない場所からのドラッグ → 範囲選択(Shift で追加選択)
-          if (!e.shiftKey) { this.r.selection.clear(); this.setSketchSub(null) }
+          if (!e.shiftKey) { this.r.selection.clear(); this.setSketchSub(null); this.sketchLocked = false }
           this.marquee = { start: p, cur: p, additive: e.shiftKey }
         }
         this.onSelectionChange()
@@ -668,7 +689,7 @@ export class ToolManager {
     }
 
     // 変形つまみの上では OS の「つかむ手」カーソル
-    if (this.tool === 'select' && !this.dragging && !this.handleDrag && !this.marquee) {
+    if (this.tool === 'select' && !this.dragging && !this.handleDrag && !this.marquee && !this.spaceDown) {
       const hTol = 10 / this.r.vp.zoom
       let over = false
       for (const id of this.r.selection) {
@@ -677,6 +698,20 @@ export class ToolManager {
         if (this.handlesFor(ent).some(hh => dist(p, hh.pos) < hTol)) { over = true; break }
       }
       this.canvas.style.cursor = over ? 'grab' : ''
+      // 閉路選択中: ホバーした辺を強調(クリックでその辺だけを選択)
+      const sub = this.r.sketchSub
+      let hover: { id: string; edgeIdx: number } | null = null
+      if (sub?.mode === 'loop') {
+        const ent = this.store.byId(sub.id)
+        if (ent?.type === 'sketch') {
+          const ei = this.edgeIdxAt(ent, p)
+          if (ei >= 0) hover = { id: ent.id, edgeIdx: ei }
+        }
+      }
+      if (JSON.stringify(hover) !== JSON.stringify(this.r.sketchHover)) {
+        this.r.sketchHover = hover
+        this.r.requestDraw()
+      }
     }
 
     if (this.handleDrag) {
@@ -719,7 +754,10 @@ export class ToolManager {
     }
     if (this.dragging && this.tool === 'select') {
       const d = sub(p, this.dragStart)
-      if (Math.abs(d.x) + Math.abs(d.y) > 3 / this.r.vp.zoom) this.drillPending = null
+      if (Math.abs(d.x) + Math.abs(d.y) > 3 / this.r.vp.zoom) {
+        this.drillPending = null
+        this.sketchCyclePend = null // 移動中は選択を切り替えない
+      }
       const sd = pt(snapTo(d.x, this.snapStep), snapTo(d.y, this.snapStep))
       for (const [id, orig] of this.dragOrig) {
         const ent = this.store.byId(id)
@@ -788,6 +826,13 @@ export class ToolManager {
       this.r.selection.clear()
       this.r.selection.add(this.drillPending)
       this.drillPending = null
+      this.onSelectionChange()
+      this.r.requestDraw()
+    }
+    if (this.sketchCyclePend) {
+      // 静止クリック: 選択サイクルを進める(面 → 閉路 → 全体 → ロック / 閉路中は辺クリックでその辺)
+      this.cycleSketchSub(this.sketchCyclePend.ent, this.sketchCyclePend.p)
+      this.sketchCyclePend = null
       this.onSelectionChange()
       this.r.requestDraw()
     }
@@ -860,7 +905,7 @@ export class ToolManager {
     this.rectStart = null; this.penPts = []; this.penTarget = null; this.numBuf = ''
     this.dupAwaitBase = false; this.dupFrom = null
     this.elevWallStart = null
-    this.canvas.style.cursor = ''
+    this.updateCursor()
     this.r.requestDraw()
   }
   /** ヒントバーを現在の状態(立面図かどうか等)に合わせて更新 */
@@ -908,7 +953,7 @@ export class ToolManager {
     const base = this.snapPoint(p)
     this.dupAwaitBase = false
     this.dupFrom = base
-    this.canvas.style.cursor = ''
+    this.updateCursor()
     this.onDupBase(base)
   }
 
@@ -955,14 +1000,26 @@ export class ToolManager {
     this.r.requestDraw()
   }
 
+  /** ツール・Space の状態に合わせたカーソル(Space = 手 / 鉛筆 = 鉛筆アイコン) */
+  private updateCursor(): void {
+    this.canvas.style.cursor = this.spaceDown ? CURSOR_HAND
+      : this.tool === 'pencil' ? CURSOR_PENCIL
+      : this.dupAwaitBase ? 'crosshair' : ''
+  }
+
   key(e: KeyboardEvent): void {
-    if (e.key === ' ') { this.spaceDown = e.type === 'keydown'; return }
+    if (e.key === ' ') {
+      this.spaceDown = e.type === 'keydown'
+      this.updateCursor()
+      return
+    }
     if (e.type !== 'keydown') return
     if (e.key === 'Escape') {
       // Esc: 作図キャンセル + 選択解除 + 選択ツールへ戻る
       this.cancel()
       this.r.selection.clear()
       this.setSketchSub(null)
+      this.sketchLocked = false
       this.onSelectionChange()
       if (this.tool !== 'select') this.setTool('select')
       return
@@ -1706,9 +1763,18 @@ export class ToolManager {
         // 辺サブ選択中: その辺の両端だけ / 通常: 全頂点(同じ位置の端点はまとめて動く=スケール変更)
         const sub = this.r.sketchSub?.id === ent.id ? this.r.sketchSub : null
         if (sub?.mode === 'edge' && sub.edgeIdx !== undefined && ent.edges[sub.edgeIdx]) {
+          // 辺の両端つまみ: 同じ位置の端点(接続している辺)も一緒に動かして接続を保つ。
+          // 並行位置にある反対側の辺は変わらない
           const ed = ent.edges[sub.edgeIdx]
           return (['a', 'b'] as const).map(end => ({
-            key: `e${end}`, pos: ed[end], apply: (q: Pt) => { ed[end] = q }
+            key: `e${end}`, pos: ed[end],
+            apply: (q: Pt) => {
+              const cur = { ...ed[end] }
+              for (const e2 of ent.edges) {
+                if (dist(e2.a, cur) < 3) e2.a = { ...q }
+                if (dist(e2.b, cur) < 3) e2.b = { ...q }
+              }
+            }
           }))
         }
         const seen: Pt[] = []

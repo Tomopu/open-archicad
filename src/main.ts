@@ -1522,6 +1522,8 @@ async function ensure3D(): Promise<View3D> {
     view3d.onToggleDrawMode = () => tm.toggleDrawMode()
     view3d.getComponentDef = () => tm.placingComponent?.entities ?? null
     view3d.getPlaceRot = () => tm.placeRot
+    view3d.onPlanCursor = p => tm.setCursorHint(p)
+    view3d.getNumBuf = () => tm.numBuffer
     view3d.getPreviewEntity = p => {
       const t = tm.tool
       switch (t) {
@@ -1825,9 +1827,16 @@ window.addEventListener('keydown', e => {
     e.preventDefault(); void commands.save()
     return
   }
+  if (e.key === ' ') {
+    view3d?.setSpace(true)
+    if (!$('#view3d').hidden) e.preventDefault() // 3D 中のスクロール防止
+  }
   tm.key(e)
 })
-window.addEventListener('keyup', e => tm.key(e))
+window.addEventListener('keyup', e => {
+  if (e.key === ' ') view3d?.setSpace(false)
+  tm.key(e)
+})
 
 // ================= 自動保存(リロードしても消えない) =================
 let autosaveTimer: number | undefined

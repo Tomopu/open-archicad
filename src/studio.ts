@@ -5,7 +5,7 @@ import * as THREE from 'three'
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
 import { Evaluator, Brush, ADDITION, SUBTRACTION, INTERSECTION } from 'three-bvh-csg'
 import { CustomE, uid } from './model'
-import { Pt, pt, dist, angleDetentDeg, snapTo, strokePerpGuide } from './geometry'
+import { Pt, pt, dist, norm, angleDetentDeg, snapTo, strokePerpGuide, CURSOR_PENCIL, CURSOR_HAND } from './geometry'
 import { SketchOverlay, axisLock, SnapInfo } from './sketchInput'
 import { params } from './tools'
 
@@ -583,13 +583,50 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
   }
   const refresh = (): void => { exitPreview(); rotMode = false; rebuildParts(); renderList(); renderFields() }
 
+  // Space 押下中 = 視点操作(手のカーソル)。2D・3D と共通の操作系
+  let spaceOn = false
+  /** 鉛筆の数値長さ入力(2D・3D と共通仕様): 数字 + Enter でその長さの辺 */
+  let numBuf = ''
+  let penHover: Pt | null = null
+  const applyCursor = (): void => {
+    renderer.domElement.style.cursor = spaceOn ? CURSOR_HAND : penMode ? CURSOR_PENCIL : ''
+  }
+  const onSpaceKey = (e: KeyboardEvent): void => {
+    const tag = (e.target as HTMLElement).tagName
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
+    if (e.key === ' ') {
+      spaceOn = e.type === 'keydown'
+      applyCursor()
+      e.preventDefault()
+      return
+    }
+    if (e.type !== 'keydown') return
+    // 鉛筆(線)モード: 2 点目以降は数値 + Enter で長さ指定
+    if (penMode && params.pencil.mode === 'poly' && penPts.length) {
+      if (/^[0-9.]$/.test(e.key)) { numBuf += e.key; return }
+      if (e.key === 'Backspace' && numBuf) { numBuf = numBuf.slice(0, -1); return }
+      if (e.key === 'Enter' && numBuf) {
+        const len = parseFloat(numBuf)
+        numBuf = ''
+        const last = penPts[penPts.length - 1]
+        const dir = penHover ? norm(pt(penHover.x - last.x, penHover.y - last.y)) : pt(1, 0)
+        if (len > 0 && (dir.x || dir.y)) penPts.push(pt(Math.round(last.x + dir.x * len), Math.round(last.y + dir.y * len)))
+        render()
+      }
+    }
+  }
+  window.addEventListener('keydown', onSpaceKey)
+  window.addEventListener('keyup', onSpaceKey)
+
   const penButton = modal.querySelector('[data-add="pen"]') as HTMLButtonElement
   const setPenMode = (on: boolean): void => {
     penMode = on
     penPts = []
     penRectStart = null
+    numBuf = ''
     sketchOv.hide()
     penButton.classList.toggle('active', on)
+    applyCursor()
     render()
   }
   /** 多角形パーツの再正規化: 頂点編集後に bbox 中心・寸法を取り直す */
@@ -722,6 +759,7 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
 
   renderer.domElement.addEventListener('pointerdown', e => {
     if (e.button !== 0 || previewing) return
+    if (spaceOn) return // Space 中は視点操作(OrbitControls に任せる)
     // 基準点複写: 1 クリック目 = 基準点 / 2 クリック目 = 配置先
     if (dupState) {
       e.stopPropagation()
@@ -835,6 +873,7 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
   }, true)
 
   renderer.domElement.addEventListener('pointermove', e => {
+    if (spaceOn) return // 視点操作中はオーバーレイ更新もしない
     // 基準点複写: 十字 + スナップガイド。基準点決定後はゴーストがカーソルに追従
     if (dupState) {
       const gp = groundPt(e)
@@ -854,10 +893,12 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
     if (penMode) {
       const pc = penCursor(e)
       if (pc) {
+        penHover = pc.cur
         sketchOv.update({
           camera, canvas: renderer.domElement,
           cursor: pc.cur, y: 0, pts: penPts, rectStart: penRectStart,
-          snap: pc.snap, axis: pc.axis, mode: params.pencil.mode
+          snap: pc.snap, axis: pc.axis, mode: params.pencil.mode,
+          dims: numBuf ? [{ text: `${numBuf} ⏎`, at: pc.cur }] : undefined
         })
         render()
       }
@@ -1051,6 +1092,8 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
   // ---------- プレビュー・保存・終了 ----------
   const close = (): void => {
     window.removeEventListener('pointerup', winUp)
+    window.removeEventListener('keydown', onSpaceKey)
+    window.removeEventListener('keyup', onSpaceKey)
     sketchOv.dispose()
     renderer.dispose()
     modal.remove()

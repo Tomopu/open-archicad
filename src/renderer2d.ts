@@ -50,6 +50,8 @@ export class Renderer2D {
   showRefLine = true
   /** スケッチのサブ選択(面・閉路・辺)。ツール側から設定 */
   sketchSub: { id: string; mode: 'face' | 'loop' | 'edge'; faceIdx?: number; edgeIdx?: number } | null = null
+  /** 閉路選択中にホバーしている辺(強調表示) */
+  sketchHover: { id: string; edgeIdx: number } | null = null
   /** 立面図モード(正面・背面・左右側面)。null = 平面図 */
   elevation: { dir: ElevDir; cluster: number } | null = null
   /** 下階を透かして表示(2階以上で編集するときの位置合わせ用) */
@@ -136,7 +138,8 @@ export class Renderer2D {
       else if (e.type === 'dimension') sym.drawDimension(ctx, e, vp.zoom)
       else if (e.type === 'label') sym.drawLabel(ctx, e)
       else if (e.type === 'sketch') {
-        sym.drawSketch(ctx, e, vp.zoom, this.sketchSub?.id === e.id ? this.sketchSub : null)
+        sym.drawSketch(ctx, e, vp.zoom, this.sketchSub?.id === e.id ? this.sketchSub : null,
+          this.sketchHover?.id === e.id ? this.sketchHover.edgeIdx : null)
       }
     }
 

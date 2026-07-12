@@ -1,6 +1,11 @@
 // 幾何計算ユーティリティ(単位: mm)
 export interface Pt { x: number; y: number }
 
+/** ツール別カーソル(2D・3D・部品スタジオ共通)。鉛筆 = 鉛筆アイコン / 視点移動(Space) = 手 */
+export const CURSOR_PENCIL =
+  `url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22"><path d="M2.5 19.5l1.3-4.4L14.6 4.3a1.8 1.8 0 0 1 2.5 0l.6.6a1.8 1.8 0 0 1 0 2.5L6.9 18.2 2.5 19.5z" fill="white" stroke="%231f2937" stroke-width="1.4"/><path d="M12.8 6l2.7 2.7" stroke="%231f2937" stroke-width="1.2"/></svg>') 2 20, crosshair`
+export const CURSOR_HAND = 'grab'
+
 export const pt = (x: number, y: number): Pt => ({ x, y })
 export const add = (a: Pt, b: Pt): Pt => ({ x: a.x + b.x, y: a.y + b.y })
 export const sub = (a: Pt, b: Pt): Pt => ({ x: a.x - b.x, y: a.y - b.y })

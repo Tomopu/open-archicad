@@ -453,7 +453,8 @@ export function drawLabel(ctx: CanvasRenderingContext2D, l: LabelE): void {
  */
 export function drawSketch(
   ctx: CanvasRenderingContext2D, s: SketchE, zoom: number,
-  sub?: { mode: 'face' | 'loop' | 'edge'; faceIdx?: number; edgeIdx?: number } | null
+  sub?: { mode: 'face' | 'loop' | 'edge'; faceIdx?: number; edgeIdx?: number } | null,
+  hoverEdge?: number | null
 ): void {
   const faces = sketchFaces(s)
   const parents = faceNesting(faces)
@@ -486,6 +487,16 @@ export function drawSketch(
     ctx.strokeStyle = e.color ?? INK
     lw(ctx, zoom, 1.2)
     line(ctx, e.a.x, e.a.y, e.b.x, e.b.y)
+  }
+  // ホバー中の辺(閉路選択中): 明るい青で強調 → クリックでその辺だけを選択
+  if (hoverEdge !== null && hoverEdge !== undefined && s.edges[hoverEdge]) {
+    const e = s.edges[hoverEdge]
+    ctx.save()
+    ctx.strokeStyle = '#60a5fa'
+    lw(ctx, zoom, 4)
+    ctx.globalAlpha = 0.8
+    line(ctx, e.a.x, e.a.y, e.b.x, e.b.y)
+    ctx.restore()
   }
   // 選択ハイライト(閉路 = 面の境界の辺 / 単一の辺)
   if (sub && (sub.mode === 'loop' || sub.mode === 'edge')) {
