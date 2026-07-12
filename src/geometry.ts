@@ -265,6 +265,21 @@ function reconcileFaces(sk: { faces?: Record<string, FaceInfo> }, faces: Pt[][])
   sk.faces = out
 }
 
+/**
+ * 鉛筆ストロークの垂直延長ガイド: 始点から「1 辺目と垂直な方向」の直線に吸着。
+ * 3 辺目を引くときに長方形をきれいに閉じられる(2D・3D・部品スタジオ共通)。
+ */
+export function strokePerpGuide(pts: Pt[], p: Pt, tol: number): { p: Pt; guide: { a: Pt; b: Pt } } | null {
+  if (pts.length < 2) return null
+  const o = pts[0]
+  const n = perp(norm(sub(pts[1], pts[0]))) // 1 辺目の垂直方向
+  const t = (p.x - o.x) * n.x + (p.y - o.y) * n.y
+  if (Math.abs(t) < 1) return null
+  const foot = pt(o.x + n.x * t, o.y + n.y * t)
+  if (dist(p, foot) > tol) return null
+  return { p: foot, guide: { a: o, b: foot } }
+}
+
 /** 面の入れ子: parent[i] = i を直接含む面の index(なければ -1) */
 export function faceNesting(faces: Pt[][]): number[] {
   const areas = faces.map(f => Math.abs(polyArea(f)))

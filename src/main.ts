@@ -1520,6 +1520,8 @@ async function ensure3D(): Promise<View3D> {
     view3d.onDupBase3D = p => tm.pickDupBase(p)
     view3d.getDrawMode = () => (tm.tool === 'room' ? params.room.mode : tm.tool === 'pencil' ? params.pencil.mode : null)
     view3d.onToggleDrawMode = () => tm.toggleDrawMode()
+    view3d.getComponentDef = () => tm.placingComponent?.entities ?? null
+    view3d.getPlaceRot = () => tm.placeRot
     view3d.getPreviewEntity = p => {
       const t = tm.tool
       switch (t) {
@@ -1647,6 +1649,7 @@ async function applyViewPreset(v: string): Promise<void> {
     renderElevationChips()
     await switchTab('2d')
     renderer.requestDraw()
+    tm.refreshHint()
     return
   }
   if (v.startsWith('elev-')) {
@@ -1655,6 +1658,7 @@ async function applyViewPreset(v: string): Promise<void> {
     renderer.elevation = { dir: v.slice(5) as 'front' | 'back' | 'left' | 'right', cluster: 0 }
     renderElevationChips()
     renderer.fitElevation()
+    tm.refreshHint()
     return
   }
   renderer.elevation = null

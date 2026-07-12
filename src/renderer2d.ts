@@ -304,8 +304,11 @@ export class Renderer2D {
       const X = lineIntersect(
         { x: P.x + nW.x * h * s, y: P.y + nW.y * h * s }, uIn,
         { x: P.x + nO.x * hO * s, y: P.y + nO.y * hO * s }, m.uOut)
-      // 鋭角すぎるマイターはスパイク防止のため不採用
-      if (!X || dist(X, P) > Math.max(h, hO) * 4) return null
+      if (!X) return null
+      // 鋭角のマイターは伸びすぎるため、限界長で切ってベベル(三角形の壁の先端も綺麗に収まる)
+      const lim = Math.max(h, hO) * 4
+      const dx = dist(X, P)
+      if (dx > lim) return { x: P.x + ((X.x - P.x) / dx) * lim, y: P.y + ((X.y - P.y) / dx) * lim }
       return X
     }
     if (miter?.a) {
@@ -469,12 +472,30 @@ export class Renderer2D {
     const INK = '#1f2937'
     let minU = Infinity, maxU = -Infinity
     for (const wp of walls) { minU = Math.min(minU, wp.ua); maxU = Math.max(maxU, wp.ub) }
+    // 同じ高さ範囲の壁はひとつのシルエットにマージして描く(接合部の縦線・段差を消す)
+    const groups = new Map<string, { y0: number; y1: number; ivs: { x0: number; x1: number }[] }>()
     for (const wp of walls) {
-      ctx.fillStyle = '#fafafa'
-      ctx.strokeStyle = INK
-      ctx.lineWidth = 1.2 / vp.zoom
-      ctx.fillRect(wp.ua, wp.y1, wp.ub - wp.ua, wp.y0 - wp.y1)
-      ctx.strokeRect(wp.ua, wp.y1, wp.ub - wp.ua, wp.y0 - wp.y1)
+      const key = `${Math.round(wp.y0)}:${Math.round(wp.y1)}`
+      if (!groups.has(key)) groups.set(key, { y0: wp.y0, y1: wp.y1, ivs: [] })
+      groups.get(key)!.ivs.push({ x0: wp.ua, x1: wp.ub })
+    }
+    ctx.lineWidth = 1.2 / vp.zoom
+    for (const g of groups.values()) {
+      g.ivs.sort((a, b) => a.x0 - b.x0)
+      const merged: { x0: number; x1: number }[] = []
+      for (const iv of g.ivs) {
+        const last = merged[merged.length - 1]
+        if (last && iv.x0 <= last.x1 + 1) last.x1 = Math.max(last.x1, iv.x1)
+        else merged.push({ ...iv })
+      }
+      for (const m of merged) {
+        ctx.fillStyle = '#fafafa'
+        ctx.strokeStyle = INK
+        ctx.fillRect(m.x0, g.y1, m.x1 - m.x0, g.y0 - g.y1)
+        ctx.strokeRect(m.x0, g.y1, m.x1 - m.x0, g.y0 - g.y1)
+      }
+    }
+    for (const wp of walls) {
       // この壁の建具
       for (const op of opens) {
         if (op.wall.w.id !== wp.w.id) continue

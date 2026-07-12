@@ -3,10 +3,10 @@ import {
   Store, Entity, Wall, Opening, SketchE, uid, OpeningKind, StairKind, FurnKind, EquipKind, PlantKind,
   FURN_DEFAULTS, isWindow, Room, RoomUse, DimAnchor, equipSize
 } from './model'
-import { Renderer2D, elevAxis } from './renderer2d'
+import { Renderer2D, elevAxis, ElevWallProj } from './renderer2d'
 import {
   Pt, pt, sub, add, dist, distToSeg, projT, lerp, snapTo, pointInPoly, norm, perp, polyArea, rotate,
-  arcThrough, angleDetentDeg, lineIntersect, polyCentroid, sketchFaces, faceKey, faceInfo
+  arcThrough, angleDetentDeg, lineIntersect, polyCentroid, sketchFaces, faceKey, faceInfo, strokePerpGuide
 } from './geometry'
 import {
   drawOpening, drawFurniture, drawStair, drawEquipment, drawPlanting, drawColumn,
@@ -277,6 +277,16 @@ export class ToolManager {
         : 'クリックで線を描く(閉じると面になる) / 数値入力+Enter で長さ指定 / 右クリックで終了 / Tab: 長方形モード',
       component: 'クリックでコンポーネントを配置 / R: 90°回転'
     }
+    if (this.r.elevation) {
+      const elevHints: Partial<Record<ToolName, string>> = {
+        select: 'クリック: 選択 / ドラッグ: 移動 / 壁の上端をドラッグ: 高さ変更 / 窓は上下ドラッグで窓台高',
+        wall: 'クリックで始点→終点(建物の手前の面に配置されます)',
+        door: '壁の上でクリックしてドアを配置',
+        window: '壁の上でクリックして窓を配置(クリックした高さ = 窓台高)'
+      }
+      this.setHint(elevHints[this.tool] ?? 'このツールは立面図では使えません(選択・壁・ドア・窓が使えます)')
+      return
+    }
     this.setHint(hints[this.tool])
   }
 
@@ -378,6 +388,15 @@ export class ToolManager {
             return lerp(ed.a, ed.b, projT(p, ed.a, ed.b))
           }
         }
+      }
+    }
+    // 鉛筆: 始点から 1 辺目と垂直方向の延長ガイド(3 辺目で長方形を閉じやすく)
+    if (this.tool === 'pencil' && params.pencil.mode === 'poly' && this.penPts.length >= 2) {
+      const g = strokePerpGuide(this.penPts, p, tol * 1.5)
+      if (g) {
+        this.snapKind = '垂直'
+        this.snapGuides.push(g.guide)
+        return g.p
       }
     }
     this.snapKind = this.snapStep > 0 ? 'グリッド' : null
@@ -614,10 +633,22 @@ export class ToolManager {
       this.r.requestDraw()
       return
     }
-    // 立面図: ドラッグ編集のみ(スナップ・オーバーレイは平面用なのでスキップ)
+    // 立面図: ドラッグ編集 + スナップカーソル・建具ゴーストの更新
     if (this.r.elevation) {
-      if (this.elevDrag && (e.buttons & 1)) this.elevMove(p)
+      if (this.elevDrag && (e.buttons & 1)) {
+        this.elevMove(p)
+        this.r.requestDraw()
+        return
+      }
+      this.elevCursor = this.elevSnap(p)
+      this.elevHover = null
+      if (this.tool === 'door' || this.tool === 'window') {
+        this.elevHover = [...this.r.elevWalls()].reverse().find(w =>
+          w.facing && this.elevCursor.x >= w.ua && this.elevCursor.x <= w.ub &&
+          this.elevCursor.y >= w.y1 && this.elevCursor.y <= w.y0) ?? null
+      }
       this.r.requestDraw()
+      this.onCursor(this.elevCursor)
       return
     }
     this.cursor = this.snapPoint(p)
@@ -828,9 +859,12 @@ export class ToolManager {
     this.wallStart = null; this.arcEnd = null; this.dimPts = []; this.roomPts = []
     this.rectStart = null; this.penPts = []; this.penTarget = null; this.numBuf = ''
     this.dupAwaitBase = false; this.dupFrom = null
+    this.elevWallStart = null
     this.canvas.style.cursor = ''
     this.r.requestDraw()
   }
+  /** ヒントバーを現在の状態(立面図かどうか等)に合わせて更新 */
+  refreshHint(): void { this.updateHint() }
 
   /**
    * 作図中の Undo(⌘Z): 今引いている線・入力バッファを取り消す。
@@ -1108,7 +1142,7 @@ export class ToolManager {
     if (ent) this.magnetizeEntity(ent)
   }
 
-  // ---------- 立面図の編集(選択・水平移動・高さ・建具の位置/窓台高) ----------
+  // ---------- 立面図の編集(選択・水平移動・高さ・建具の位置/窓台高・壁/建具の配置) ----------
   private elevDrag: {
     kind: 'wallU' | 'wallH' | 'open'
     id: string
@@ -1118,8 +1152,100 @@ export class ToolManager {
     /** 建具ドラッグ用: 壁の両端の立面 U 座標 */
     uA?: number; uB?: number
   } | null = null
+  /** 立面図のスナップ済みカーソル・ガイド線・建具ツールのホバー先・壁ツールの始点 */
+  private elevCursor: Pt = pt(0, 0)
+  private elevGuides: { a: Pt; b: Pt }[] = []
+  private elevHover: ElevWallProj | null = null
+  private elevWallStart: number | null = null
+
+  /** 立面図のスナップ: 壁の端・建具の端の X / 壁の天端・GL の Y に吸着(ガイド線付き)。他はグリッド */
+  private elevSnap(p: Pt): Pt {
+    this.elevGuides = []
+    const tol = 12 / this.r.vp.zoom
+    const walls = this.r.elevWalls()
+    const opens = this.r.elevOpenings()
+    const xC: { v: number; src: Pt }[] = []
+    const yC: { v: number; src: Pt }[] = [{ v: 0, src: pt(p.x, 0) }]
+    for (const w of walls) {
+      xC.push({ v: w.ua, src: pt(w.ua, w.y1) }, { v: w.ub, src: pt(w.ub, w.y1) })
+      yC.push({ v: w.y1, src: pt(w.ua, w.y1) })
+    }
+    for (const o of opens) {
+      xC.push({ v: o.x0, src: pt(o.x0, o.y1) }, { v: o.x1, src: pt(o.x1, o.y1) })
+      yC.push({ v: o.y0, src: pt(o.x0, o.y0) }, { v: o.y1, src: pt(o.x0, o.y1) })
+    }
+    let bx: { v: number; src: Pt } | null = null
+    let by: { v: number; src: Pt } | null = null
+    for (const c of xC) if (Math.abs(c.v - p.x) < (bx ? Math.abs(bx.v - p.x) : tol)) bx = c
+    for (const c of yC) if (Math.abs(c.v - p.y) < (by ? Math.abs(by.v - p.y) : tol)) by = c
+    const out = pt(
+      bx ? bx.v : snapTo(p.x, this.snapStep),
+      by ? by.v : -Math.max(0, snapTo(-p.y, 50))
+    )
+    if (bx && Math.abs(out.y - bx.src.y) > 1) this.elevGuides.push({ a: bx.src, b: pt(bx.v, out.y) })
+    if (by && Math.abs(out.x - by.src.x) > 1) this.elevGuides.push({ a: by.src, b: pt(out.x, by.v) })
+    return out
+  }
+
+  /** 立面図: 壁を追加(視点側=手前の面の奥行きに、立面の横方向へ) */
+  private elevAddWall(x0: number, x1: number): void {
+    const elev = this.r.elevation
+    if (!elev) return
+    const { u, v } = elevAxis(elev.dir)
+    const walls = this.r.elevWalls()
+    const d = walls.length ? Math.max(...walls.map(w => w.depth)) : 0
+    const A = pt(u.x * x0 + v.x * d, u.y * x0 + v.y * d)
+    const B = pt(u.x * x1 + v.x * d, u.y * x1 + v.y * d)
+    this.store.commit()
+    this.store.add({
+      id: uid(), type: 'wall', a: A, b: B,
+      thickness: params.wall.offR + params.wall.offL,
+      height: params.wall.height, structural: params.wall.structural
+    })
+  }
+
+  /** 立面図: クリック位置の壁に建具を配置(クリック高さ = 窓台高) */
+  private elevPlaceOpening(sp: Pt): void {
+    const wp = [...this.r.elevWalls()].reverse().find(w =>
+      w.facing && sp.x >= w.ua && sp.x <= w.ub && sp.y >= w.y1 && sp.y <= w.y0)
+    if (!wp) { this.setHint('壁の上でクリックしてください'); return }
+    const { u } = elevAxis(this.r.elevation!.dir)
+    const uA = wp.w.a.x * u.x + wp.w.a.y * u.y
+    const uB = wp.w.b.x * u.x + wp.w.b.y * u.y
+    if (Math.abs(uB - uA) < 1) return
+    const pr = this.tool === 'door' ? params.door : params.window
+    const L = dist(wp.w.a, wp.w.b)
+    const half = Math.min(0.5, pr.width / (2 * L))
+    const t = Math.min(Math.max((sp.x - uA) / (uB - uA), half), 1 - half)
+    let sill = 0
+    let head = pr.head
+    if (this.tool === 'window') {
+      const winH = params.window.head - params.window.sill
+      sill = Math.min(Math.max(0, snapTo(-sp.y - wp.floorY - winH / 2, 50)), Math.max(0, wp.w.height - winH))
+      head = sill + winH
+    }
+    this.store.commit()
+    this.store.doc.levels[wp.level].entities.push({
+      id: uid(), type: 'opening', wallId: wp.w.id, t,
+      width: pr.kind === 'door_double' ? Math.max(pr.width, 1200) : pr.width,
+      kind: pr.kind, flip: this.placeFlip, swap: this.placeSwap, sill, head
+    })
+    this.store.emit()
+  }
 
   private elevDown(p: Pt): void {
+    // 作図ツール(壁・ドア・窓)は立面図でも使える
+    const sp = this.elevSnap(p)
+    if (this.tool === 'door' || this.tool === 'window') { this.elevPlaceOpening(sp); return }
+    if (this.tool === 'wall') {
+      if (this.elevWallStart === null) this.elevWallStart = sp.x
+      else if (Math.abs(sp.x - this.elevWallStart) > 1) {
+        this.elevAddWall(this.elevWallStart, sp.x)
+        this.elevWallStart = sp.x // 連続入力
+      }
+      return
+    }
+    if (this.tool !== 'select') return
     const tol = 10 / this.r.vp.zoom
     // 建具を優先(手前の壁から)
     const opens = this.r.elevOpenings()
@@ -1214,25 +1340,28 @@ export class ToolManager {
       return
     }
     this.store.commit()
-    for (const id of this.r.selection) {
-      const ent = this.store.byId(id)
-      if (!ent) continue
-      if ('rot' in ent) (ent as { rot: number }).rot += Math.PI / 2
-      else if (ent.type === 'opening') ent.flip = !ent.flip
-      else if (ent.type === 'wall') {
-        // 中点を軸に 90° 回転
-        const c = pt((ent.a.x + ent.b.x) / 2, (ent.a.y + ent.b.y) / 2)
-        const rot90 = (q: Pt): Pt => pt(c.x - (q.y - c.y), c.y + (q.x - c.x))
+    // 選択全体の共通中心で回す(複数選択でも相対位置が保たれ、形が崩れない)
+    const ents = [...this.r.selection].map(id => this.store.byId(id)).filter((e): e is Entity => !!e)
+    const ptsAll: Pt[] = []
+    for (const ent of ents) {
+      if (ent.type === 'wall' || ent.type === 'dimension') ptsAll.push(ent.a, ent.b)
+      else if (ent.type === 'room') ptsAll.push(...ent.poly)
+      else if (ent.type === 'sketch') ptsAll.push(...ent.edges.flatMap(ed => [ed.a, ed.b]))
+      else if ('pos' in ent) ptsAll.push((ent as { pos: Pt }).pos)
+    }
+    if (!ptsAll.length) return
+    const xs = ptsAll.map(q => q.x), ys = ptsAll.map(q => q.y)
+    const c = pt((Math.min(...xs) + Math.max(...xs)) / 2, (Math.min(...ys) + Math.max(...ys)) / 2)
+    const rot90 = (q: Pt): Pt => pt(c.x - (q.y - c.y), c.y + (q.x - c.x))
+    for (const ent of ents) {
+      if (ent.type === 'wall' || ent.type === 'dimension') {
         ent.a = rot90(ent.a); ent.b = rot90(ent.b)
+      } else if (ent.type === 'opening') {
+        // 建具は壁に従属(壁が回れば一緒に回る)。単体選択なら内外反転
+        if (ents.length === 1) ent.flip = !ent.flip
       } else if (ent.type === 'room') {
-        const xs = ent.poly.map(q => q.x), ys = ent.poly.map(q => q.y)
-        const c = pt((Math.min(...xs) + Math.max(...xs)) / 2, (Math.min(...ys) + Math.max(...ys)) / 2)
-        ent.poly = ent.poly.map(q => pt(c.x - (q.y - c.y), c.y + (q.x - c.x)))
+        ent.poly = ent.poly.map(rot90)
       } else if (ent.type === 'sketch') {
-        const ps = ent.edges.flatMap(ed => [ed.a, ed.b])
-        const xs = ps.map(q => q.x), ys = ps.map(q => q.y)
-        const c = pt((Math.min(...xs) + Math.max(...xs)) / 2, (Math.min(...ys) + Math.max(...ys)) / 2)
-        const rot90 = (q: Pt): Pt => pt(c.x - (q.y - c.y), c.y + (q.x - c.x))
         ent.edges = ent.edges.map(ed => ({ ...ed, a: rot90(ed.a), b: rot90(ed.b) }))
         if (ent.faces) {
           const nf: typeof ent.faces = {}
@@ -1243,6 +1372,10 @@ export class ToolManager {
           }
           ent.faces = nf
         }
+      } else if ('pos' in ent) {
+        ;(ent as { pos: Pt }).pos = rot90((ent as { pos: Pt }).pos)
+        if ('rot' in ent) (ent as { rot: number }).rot += Math.PI / 2
+        if ('attach' in ent) (ent as { attach?: unknown }).attach = undefined
       }
     }
     this.store.emit(); this.onSelectionChange()
@@ -1814,8 +1947,106 @@ export class ToolManager {
   }
 
   // ---------- プレビュー描画 ----------
+  /** 立面図用のオーバーレイ: スナップガイド・壁/建具のゴースト・ドラッグ中の寸法 */
+  private drawElevOverlay(ctx: CanvasRenderingContext2D, zoom: number): void {
+    const c = this.elevCursor
+    // スナップガイド(緑の点線)
+    if (this.elevGuides.length) {
+      ctx.save()
+      ctx.strokeStyle = '#16a34a'
+      ctx.lineWidth = 1 / zoom
+      ctx.setLineDash([7 / zoom, 5 / zoom])
+      for (const g of this.elevGuides) {
+        ctx.beginPath(); ctx.moveTo(g.a.x, g.a.y); ctx.lineTo(g.b.x, g.b.y); ctx.stroke()
+      }
+      ctx.setLineDash([])
+      ctx.restore()
+    }
+    // 作図ツールの十字カーソル
+    if (this.tool === 'wall' || this.tool === 'door' || this.tool === 'window') {
+      ctx.strokeStyle = '#2563eb'
+      ctx.lineWidth = 1 / zoom
+      const s = 8 / zoom
+      ctx.beginPath()
+      ctx.moveTo(c.x - s, c.y); ctx.lineTo(c.x + s, c.y)
+      ctx.moveTo(c.x, c.y - s); ctx.lineTo(c.x, c.y + s)
+      ctx.stroke()
+    }
+    ctx.fillStyle = '#2563eb'
+    ctx.strokeStyle = '#2563eb'
+    // 壁ツール: 始点からのゴースト(高さ = ツール設定)+ 長さ
+    if (this.tool === 'wall' && this.elevWallStart !== null) {
+      ctx.save()
+      ctx.globalAlpha = 0.5
+      ctx.lineWidth = 1 / zoom
+      const x0 = Math.min(this.elevWallStart, c.x), x1 = Math.max(this.elevWallStart, c.x)
+      ctx.strokeRect(x0, -params.wall.height, x1 - x0, params.wall.height)
+      ctx.globalAlpha = 1
+      ctx.font = `${13 / zoom}px sans-serif`
+      ctx.textAlign = 'center'; ctx.textBaseline = 'bottom'
+      ctx.fillText(`${Math.round(x1 - x0)}`, (x0 + x1) / 2, -params.wall.height - 6 / zoom)
+      ctx.restore()
+    }
+    // 建具ツール: ホバー中の壁にゴースト + 壁端からの距離
+    if ((this.tool === 'door' || this.tool === 'window') && this.elevHover) {
+      const wp = this.elevHover
+      const pr = this.tool === 'door' ? params.door : params.window
+      const winH = this.tool === 'window' ? params.window.head - params.window.sill : pr.head
+      let sill = 0
+      if (this.tool === 'window') {
+        sill = Math.min(Math.max(0, snapTo(-c.y - wp.floorY - winH / 2, 50)), Math.max(0, wp.w.height - winH))
+      }
+      const cx = Math.min(Math.max(c.x, wp.ua + pr.width / 2), wp.ub - pr.width / 2)
+      const gy0 = -(wp.floorY + sill), gy1 = -(wp.floorY + sill + winH)
+      ctx.save()
+      ctx.globalAlpha = 0.5
+      ctx.lineWidth = 1.2 / zoom
+      ctx.strokeRect(cx - pr.width / 2, gy1, pr.width, gy0 - gy1)
+      ctx.globalAlpha = 1
+      this.elevEdgeDims(ctx, zoom, wp, cx - pr.width / 2, cx + pr.width / 2, (gy0 + gy1) / 2)
+      if (this.tool === 'window') {
+        ctx.font = `${12 / zoom}px sans-serif`
+        ctx.textAlign = 'center'; ctx.textBaseline = 'top'
+        ctx.fillText(`窓台高 ${Math.round(sill)}`, cx, gy0 + 6 / zoom)
+      }
+      ctx.restore()
+    }
+    // 建具ドラッグ中: 壁端からの距離 + 窓台高
+    if (this.elevDrag?.kind === 'open') {
+      const op = this.r.elevOpenings().find(o => o.o.id === this.elevDrag!.id)
+      if (op) {
+        ctx.save()
+        this.elevEdgeDims(ctx, zoom, op.wall, op.x0, op.x1, (op.y0 + op.y1) / 2)
+        if (isWindow(op.o.kind)) {
+          ctx.font = `${12 / zoom}px sans-serif`
+          ctx.textAlign = 'center'; ctx.textBaseline = 'top'
+          ctx.fillText(`窓台高 ${Math.round(op.o.sill)}`, (op.x0 + op.x1) / 2, op.y0 + 6 / zoom)
+        }
+        ctx.restore()
+      }
+    }
+  }
+  /** 立面図: 壁の両端 → 建具の両端の距離(点線 + 数字) */
+  private elevEdgeDims(ctx: CanvasRenderingContext2D, zoom: number, wp: ElevWallProj, x0: number, x1: number, y: number): void {
+    const seg = (from: number, to: number): void => {
+      if (to - from < 1) return
+      ctx.save()
+      ctx.strokeStyle = '#2563eb'; ctx.fillStyle = '#2563eb'
+      ctx.lineWidth = 1 / zoom
+      ctx.setLineDash([6 / zoom, 4 / zoom])
+      ctx.beginPath(); ctx.moveTo(from, y); ctx.lineTo(to, y); ctx.stroke()
+      ctx.setLineDash([])
+      ctx.font = `${12 / zoom}px sans-serif`
+      ctx.textAlign = 'center'; ctx.textBaseline = 'bottom'
+      ctx.fillText(`${Math.round(to - from)}`, (from + to) / 2, y - 3 / zoom)
+      ctx.restore()
+    }
+    seg(wp.ua, x0)
+    seg(x1, wp.ub)
+  }
+
   private drawOverlay(ctx: CanvasRenderingContext2D, zoom: number): void {
-    if (this.r.elevation) return // 立面図は閲覧専用
+    if (this.r.elevation) { this.drawElevOverlay(ctx, zoom); return }
     const c = this.cursor
     ctx.strokeStyle = '#2563eb'
     ctx.fillStyle = '#2563eb'

@@ -5,7 +5,7 @@ import * as THREE from 'three'
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
 import { Evaluator, Brush, ADDITION, SUBTRACTION, INTERSECTION } from 'three-bvh-csg'
 import { CustomE, uid } from './model'
-import { Pt, pt, dist, angleDetentDeg, snapTo } from './geometry'
+import { Pt, pt, dist, angleDetentDeg, snapTo, strokePerpGuide } from './geometry'
 import { SketchOverlay, axisLock, SnapInfo } from './sketchInput'
 import { params } from './tools'
 
@@ -287,10 +287,18 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
   const penCursor = (e: PointerEvent): { cur: Pt; snap: SnapInfo; axis: 'x' | 'y' | null } | null => {
     const gp = groundPt(e)
     if (!gp) return null
-    const snap = studioSnap(gp)
+    let snap = studioSnap(gp)
     let cur = snap.p
     let axis: 'x' | 'y' | null = null
     if (snap.kind === 'グリッド') {
+      // 始点から 1 辺目と垂直方向の延長ガイド(2D・3D と共通仕様)
+      if (params.pencil.mode === 'poly' && penPts.length >= 2) {
+        const g = strokePerpGuide(penPts, cur, 60)
+        if (g) {
+          snap = { p: g.p, kind: '垂直', guides: [...snap.guides, g.guide] }
+          return { cur: g.p, snap, axis: null }
+        }
+      }
       const al = axisLock(penRectStart ?? (penPts.length ? penPts[penPts.length - 1] : null), snap.p)
       cur = al.p
       axis = al.axis
@@ -363,6 +371,25 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
     mkSquare('x-', cx - dw.x * hx, midY, cz - dw.z * hx)
     mkSquare('z+', cx + dd.x * hz, midY, cz + dd.z * hz)
     mkSquare('z-', cx - dd.x * hz, midY, cz - dd.z * hz)
+    // 四隅: 反対の角を固定して幅・奥行を変更(3D モードと同じ)
+    for (const sx of [-1, 1]) {
+      for (const sz of [-1, 1]) {
+        mkSquare(`c${sx === 1 ? 'p' : 'm'}${sz === 1 ? 'p' : 'm'}`,
+          cx + dw.x * hx * sx + dd.x * hz * sz, midY,
+          cz + dw.z * hx * sx + dd.z * hz * sz)
+      }
+    }
+    // 鉛筆(多角形)パーツ: 各頂点のつまみ(掴んで形を変える)
+    if (p.kind === 'poly' && p.pts?.length) {
+      const sxf = p.sx / (p.bx ?? p.sx), szf = p.sz / (p.bz ?? p.sz)
+      const cosR = Math.cos(rad), sinR = Math.sin(rad)
+      p.pts.forEach((q, i) => {
+        const lx = q.x * sxf, lz = q.y * szf
+        mkSquare(`pv${i}`,
+          (p.x + lx * cosR - lz * sinR) * MM, p.y * MM + 0.02,
+          (p.z + lx * sinR + lz * cosR) * MM, 0x16a34a)
+      })
+    }
     // 上面(高さ)= 円錐(白縁取り) / 底面 = 四角
     const mkOutlined = (kind: string, x: number, y: number, z: number,
       whiteGeo: THREE.BufferGeometry, mainGeo: THREE.BufferGeometry, color: number): void => {
@@ -565,6 +592,24 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
     penButton.classList.toggle('active', on)
     render()
   }
+  /** 多角形パーツの再正規化: 頂点編集後に bbox 中心・寸法を取り直す */
+  const renormPoly = (p: StudioPart): void => {
+    if (!p.pts?.length) return
+    const sxf = p.sx / (p.bx ?? p.sx), szf = p.sz / (p.bz ?? p.sz)
+    const abs = p.pts.map(q => ({ x: q.x * sxf, y: q.y * szf }))
+    const xs = abs.map(q => q.x), ys = abs.map(q => q.y)
+    const cx = (Math.min(...xs) + Math.max(...xs)) / 2
+    const cy = (Math.min(...ys) + Math.max(...ys)) / 2
+    const rad = (p.rot * Math.PI) / 180
+    const cos = Math.cos(rad), sin = Math.sin(rad)
+    p.x = Math.round(p.x + cx * cos - cy * sin)
+    p.z = Math.round(p.z + cx * sin + cy * cos)
+    const bw = Math.max(10, Math.round(Math.max(...xs) - Math.min(...xs)))
+    const bh = Math.max(10, Math.round(Math.max(...ys) - Math.min(...ys)))
+    p.sx = bw; p.sz = bh; p.bx = bw; p.bz = bh
+    p.pts = abs.map(q => ({ x: Math.round(q.x - cx), y: Math.round(q.y - cy) }))
+  }
+
   /** 多角形(mm)をパーツ化 */
   const makePolyPart = (poly: Pt[]): void => {
     if (poly.length < 3) return
@@ -621,15 +666,25 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
   ;(actionsEl.querySelector('[data-pa="union"]') as HTMLButtonElement).onclick = () => applyBool('union')
   ;(actionsEl.querySelector('[data-pa="subtract"]') as HTMLButtonElement).onclick = () => applyBool('subtract')
   ;(actionsEl.querySelector('[data-pa="intersect"]') as HTMLButtonElement).onclick = () => applyBool('intersect')
+  // 基準点複写(3D モードと同じフロー): 基準点をクリック → ゴーストを見ながら配置先をクリック
+  let dupState: { ids: number[]; base: Pt | null } | null = null
+  const dupGhost = new THREE.Group()
+  dupGhost.scale.setScalar(MM)
+  dupGhost.visible = false
+  scene.add(dupGhost)
+  const DUP_MAT = new THREE.MeshBasicMaterial({ color: 0x2563eb, transparent: true, opacity: 0.32, depthWrite: false })
+  const endDup = (): void => {
+    dupState = null
+    dupGhost.visible = false
+    dupGhost.traverse(o => { if (o instanceof THREE.Mesh) o.geometry.dispose() })
+    dupGhost.clear()
+    sketchOv.hide()
+    render()
+  }
   ;(actionsEl.querySelector('[data-pa="dup"]') as HTMLButtonElement).onclick = () => {
-    const news: number[] = []
-    for (const i of [...selSet].sort((a, b) => a - b)) {
-      const p = parts[i]
-      parts.push({ ...JSON.parse(JSON.stringify(p)), x: p.x + 200, z: p.z + 200 })
-      news.push(parts.length - 1)
-    }
-    selSet.clear(); news.forEach(i => selSet.add(i))
-    refresh()
+    if (!selSet.size) return
+    dupState = { ids: [...selSet].sort((a, b) => a - b), base: null }
+    renderer.domElement.style.cursor = 'crosshair'
   }
   ;(actionsEl.querySelector('[data-pa="rot"]') as HTMLButtonElement).onclick = () => {
     rotMode = !rotMode
@@ -667,6 +722,40 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
 
   renderer.domElement.addEventListener('pointerdown', e => {
     if (e.button !== 0 || previewing) return
+    // 基準点複写: 1 クリック目 = 基準点 / 2 クリック目 = 配置先
+    if (dupState) {
+      e.stopPropagation()
+      const gp = groundPt(e)
+      if (!gp) return
+      const sp = studioSnap(gp).p
+      if (!dupState.base) {
+        dupState.base = sp
+        // ゴースト: 選択パーツの形をそのまま半透明で
+        for (const i of dupState.ids) {
+          const p = parts[i]
+          if (!p) continue
+          const geoPart = p.kind === 'poly' && p.sy < 1 ? { ...p, sy: 2 } : p
+          dupGhost.add(new THREE.Mesh(partGeometry(geoPart), DUP_MAT))
+        }
+        dupGhost.position.set(0, 0, 0)
+        dupGhost.visible = true
+        render()
+        return
+      }
+      const off = { x: sp.x - dupState.base.x, y: sp.y - dupState.base.y }
+      const news: number[] = []
+      for (const i of dupState.ids) {
+        const p = parts[i]
+        if (!p) continue
+        parts.push({ ...JSON.parse(JSON.stringify(p)), x: Math.round(p.x + off.x), z: Math.round(p.z + off.y) })
+        news.push(parts.length - 1)
+      }
+      selSet.clear(); news.forEach(i => selSet.add(i))
+      renderer.domElement.style.cursor = ''
+      endDup()
+      refresh()
+      return
+    }
     // 鉛筆モード: 地面(y=0)クリックで頂点を追加(3D モードと同じスナップ・軸ロック)。
     // 長方形モード(params.pencil.mode)は 2 点で確定、鉛筆は始点クリックで閉じる
     if (penMode) {
@@ -746,6 +835,22 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
   }, true)
 
   renderer.domElement.addEventListener('pointermove', e => {
+    // 基準点複写: 十字 + スナップガイド。基準点決定後はゴーストがカーソルに追従
+    if (dupState) {
+      const gp = groundPt(e)
+      if (gp) {
+        const snap = studioSnap(gp)
+        sketchOv.update({
+          camera, canvas: renderer.domElement,
+          cursor: snap.p, y: 0, snap
+        })
+        if (dupState.base) {
+          dupGhost.position.set((snap.p.x - dupState.base.x) * MM, 0, (snap.p.y - dupState.base.y) * MM)
+        }
+        render()
+      }
+      return
+    }
     if (penMode) {
       const pc = penCursor(e)
       if (pc) {
@@ -822,6 +927,42 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
           p.sy = Math.max(10, top - newY) // 底面を押し引き(上面固定)
           p.y = top - p.sy
         }
+      } else if (k.startsWith('pv')) {
+        // 多角形の頂点: 掴んで形を変える(bbox を再正規化)
+        if (p.kind !== 'poly' || !p.pts) return
+        const idx = parseInt(k.slice(2), 10)
+        if (!p.pts[idx]) return
+        const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -handleDrag.grabY)
+        const q = new THREE.Vector3()
+        if (!ray.ray.intersectPlane(plane, q)) return
+        const snapped = studioSnap(pt(q.x / MM, q.z / MM)).p
+        const dx = snapped.x - p.x, dz = snapped.y - p.z
+        const rad = (p.rot * Math.PI) / 180
+        const cos = Math.cos(rad), sin = Math.sin(rad)
+        const sxf = p.sx / (p.bx ?? p.sx), szf = p.sz / (p.bz ?? p.sz)
+        p.pts[idx] = {
+          x: Math.round((dx * cos + dz * sin) / (sxf || 1)),
+          y: Math.round((-dx * sin + dz * cos) / (szf || 1))
+        }
+        renormPoly(p)
+      } else if (k[0] === 'c' && k.length === 3) {
+        // 四隅: 反対の角を固定して幅・奥行を変更
+        const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -handleDrag.grabY)
+        const q = new THREE.Vector3()
+        if (!ray.ray.intersectPlane(plane, q)) return
+        const lx = q.x / MM - p.x, lz = q.z / MM - p.z
+        const rad = (p.rot * Math.PI) / 180
+        const cos = Math.cos(rad), sin = Math.sin(rad)
+        const local = { x: lx * cos + lz * sin, z: -lx * sin + lz * cos }
+        const sx = k[1] === 'p' ? 1 : -1
+        const sz = k[2] === 'p' ? 1 : -1
+        const ax = (-sx * p.sx) / 2, az = (-sz * p.sz) / 2
+        const w = Math.max(10, Math.round(Math.abs(local.x - ax) / 10) * 10)
+        const d = Math.max(10, Math.round(Math.abs(local.z - az) / 10) * 10)
+        const cLocal = { x: ax + (sx * w) / 2, z: az + (sz * d) / 2 }
+        p.x += cLocal.x * cos - cLocal.z * sin
+        p.z += cLocal.x * sin + cLocal.z * cos
+        p.sx = w; p.sz = d
       } else {
         const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -handleDrag.grabY)
         const q = new THREE.Vector3()
@@ -899,6 +1040,7 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
   renderer.domElement.addEventListener('contextmenu', e => {
     e.preventDefault()
     if (penMode) setPenMode(false) // 右クリックで鉛筆をキャンセル
+    if (dupState) { renderer.domElement.style.cursor = ''; endDup() } // 右クリックで複写をキャンセル
   })
   // キャンバス外で離した場合も確実に終了(紫つまみが付いてくる問題の防止)
   const winUp = (e: PointerEvent): void => {

@@ -321,6 +321,10 @@ export class View3D {
   /** 鉛筆 / 長方形モード(2D と共有)。null = アイコン非表示 */
   getDrawMode: () => 'poly' | 'rect' | null = () => null
   onToggleDrawMode: () => void = () => {}
+  /** 配置中のコンポーネント(基準点相対のエンティティ群)と回転。ゴースト表示に使う */
+  getComponentDef: () => Entity[] | null = () => null
+  getPlaceRot: () => number = () => 0
+  private ghostDefRef: unknown = null
   /** 共通の作図オーバーレイ(十字カーソル・ライブ線・ガイド・青寸法) */
   private sketchOv: SketchOverlay
   /** 直近の作図カーソル(スナップ・軸ロック済み)。クリック配置に使う */
@@ -518,7 +522,7 @@ export class View3D {
     return this.raycaster
   }
   /** activeOnly: 編集中の階のオブジェクトだけを対象にする(選択時) */
-  private pick(e: PointerEvent, activeOnly = false): { id: string; level: number; point: THREE.Vector3; topFace: boolean } | null {
+  private pick(e: PointerEvent, activeOnly = false): { id: string; level: number; point: THREE.Vector3; topFace: boolean; normal: THREE.Vector3 | null } | null {
     const hits = this.ray(e).intersectObjects(this.model.children, true)
     for (const h of hits) {
       let o: THREE.Object3D | null = h.object
@@ -530,11 +534,45 @@ export class View3D {
           id: o.userData.entId as string,
           level: o.userData.level as number,
           point: h.point,
-          topFace: (n?.y ?? 0) > 0.7
+          topFace: (n?.y ?? 0) > 0.7,
+          normal: n
         }
       }
     }
     return null
+  }
+
+  // ---------- 面の選択 → プッシュ / プル(その面だけを伸縮) ----------
+  /** 選択中の面(box 系オブジェクトの 1 面)。kind は既存の辺つまみと同じ意味 */
+  private faceSel: { id: string; kind: string } | null = null
+  private facePending: string | null = null
+  /** クリックした面の法線 → どの辺 / 高さつまみに相当するか */
+  private faceKindFromNormal(ent: { rot: number }, n: THREE.Vector3): string | null {
+    const cos = Math.cos(ent.rot), sin = Math.sin(ent.rot)
+    const lx = n.x * cos + n.z * sin
+    const lz = -n.x * sin + n.z * cos
+    if (n.y > 0.7) return 'h'
+    if (n.y < -0.7) return null // 底面は対象外
+    if (Math.abs(lx) >= Math.abs(lz)) return lx >= 0 ? 'ex+' : 'ex-'
+    return lz >= 0 ? 'ez+' : 'ez-'
+  }
+  /** ギズモドラッグの開始(つまみ・面プッシュプル共通) */
+  private startGizmoDrag(ent: Entity, kind: string, point: THREE.Vector3, pointerId: number): void {
+    try { this.renderer.domElement.setPointerCapture(pointerId) } catch { /* noop */ }
+    this.controls.enabled = false
+    this.renderer.domElement.style.cursor = 'grabbing'
+    this.store!.commit()
+    const hasWD = ent.type === 'furniture' || ent.type === 'column' || ent.type === 'custom'
+    this.gizmoDrag = {
+      kind, id: ent.id,
+      grabY: point.y,
+      startElev: ent.type === 'furniture' ? (ent.elev ?? 0) : 0,
+      startPtY: point.y,
+      startW: hasWD ? ent.w : 0,
+      startD: hasWD ? ent.d : 0,
+      startH: hasWD ? ent.h : 0,
+      startDist: hasWD ? Math.max(0.05, Math.hypot(point.x - ent.pos.x * M, point.z - ent.pos.y * M)) : 1
+    }
   }
   private showHint(text: string, clientX: number, clientY: number): void {
     const r = this.container.getBoundingClientRect()
@@ -634,6 +672,19 @@ export class View3D {
         mkOutlined(this.gizmo, `sf${i}`, c.x * M, yBase + (info.h ?? 0) * M + 0.14, c.y * M,
           new THREE.ConeGeometry(0.10, 0.21, 12), new THREE.ConeGeometry(0.072, 0.16, 12), 0x2563eb)
       })
+      // 辺の端点つまみ(2D と同じ: 同じ位置の端点はまとめて動く)
+      this.sketchVerts(e).forEach((v, i) => {
+        const g = new THREE.Group()
+        const white = new THREE.Mesh(new THREE.BoxGeometry(0.10, 0.10, 0.10),
+          new THREE.MeshBasicMaterial({ color: 0xffffff, depthTest: false }))
+        const blue = new THREE.Mesh(new THREE.BoxGeometry(0.072, 0.072, 0.072),
+          new THREE.MeshBasicMaterial({ color: 0x2563eb, depthTest: false }))
+        white.renderOrder = 998; blue.renderOrder = 999
+        g.add(white, blue)
+        g.position.set(v.x * M, yBase + 0.02, v.y * M)
+        g.userData.gizmo = `sv${i}`
+        this.gizmo.add(g)
+      })
       return
     }
     if (e.type !== 'furniture' && e.type !== 'column' && e.type !== 'custom') return
@@ -664,10 +715,10 @@ export class View3D {
     mkSquare('ex-', cx - dirW.x * hw, midY, cz - dirW.z * hw)
     mkSquare('ez+', cx + dirD.x * hd, midY, cz + dirD.z * hd)
     mkSquare('ez-', cx - dirD.x * hd, midY, cz - dirD.z * hd)
-    // 四隅: 全体スケール
+    // 四隅: 反対の角を固定して幅・奥行を変更(2D と同じ挙動)
     for (const sx of [-1, 1]) {
       for (const sz of [-1, 1]) {
-        mkSquare('corner',
+        mkSquare(`c${sx === 1 ? 'p' : 'm'}${sz === 1 ? 'p' : 'm'}`,
           cx + dirW.x * hw * sx + dirD.x * hd * sz, midY,
           cz + dirW.z * hw * sx + dirD.z * hd * sz)
       }
@@ -679,6 +730,17 @@ export class View3D {
       mkOutlined(this.gizmo, 'elev', cx, topY + off * 2.8, cz,
         new THREE.SphereGeometry(0.068, 12, 10), new THREE.SphereGeometry(0.05, 12, 10), 0x9333ea)
     }
+  }
+
+  /** スケッチの一意な端点(3mm でマージ。2D のハンドルと同じ並び) */
+  private sketchVerts(e: SketchE): Pt[] {
+    const seen: Pt[] = []
+    for (const ed of e.edges) {
+      for (const p of [ed.a, ed.b]) {
+        if (!seen.some(s => dist(s, p) < 3)) seen.push(p)
+      }
+    }
+    return seen
   }
 
   /** 選択状態のハイライトを再構築なしで反映(軽量) */
@@ -765,8 +827,20 @@ export class View3D {
     return pt(p.x * 1000, p.z * 1000)
   }
 
+  /** 選択ツール中: 左ドラッグ = 範囲選択、回転は右ドラッグへ(その他のツールは左 = 回転) */
+  private syncControlButtons(): void {
+    const sel = this.getTool() === 'select'
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ;(this.controls as any).mouseButtons = sel
+      ? { LEFT: null, MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.ROTATE }
+      : { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN }
+  }
+
   private pointerDown(e: PointerEvent): void {
-    if (e.button !== 0 || !this.store) return
+    if (e.button !== 0 || !this.store) {
+      this.syncControlButtons()
+      return
+    }
     this.downAt = { x: e.clientX, y: e.clientY }
     if (this.measureOn) { e.stopPropagation(); return } // 計測クリックは up で処理
     // ギズモのハンドルを最優先で判定(つまみはグループなので再帰 + 親を辿る)
@@ -819,21 +893,20 @@ export class View3D {
         return
       }
     }
+    this.syncControlButtons()
     if (this.getTool() !== 'select') return // 配置ツール中はクリック(up)で配置。ドラッグはカメラ操作のまま
     if (this.getDupAwait()) return // 基準点複写中はクリック(up)で基準点を拾う
     // 選択は編集中の階のオブジェクトのみ(1F 編集中は 1F だけ選べる)
     const hit = this.pick(e, true)
     if (!hit) {
-      // Shift+空ドラッグ → 範囲選択(緑の点線)
-      if (e.shiftKey) {
-        e.stopPropagation()
-        this.controls.enabled = false
-        const el = document.createElement('div')
-        el.style.cssText =
-          'position:absolute;z-index:40;border:1.5px dashed #16a34a;background:rgba(22,163,74,.06);pointer-events:none'
-        this.container.appendChild(el)
-        this.marquee3d = { x0: e.clientX, y0: e.clientY, el }
-      }
+      // 空ドラッグ → 範囲選択(緑の点線)。カメラ回転は右ドラッグ
+      e.stopPropagation()
+      this.controls.enabled = false
+      const el = document.createElement('div')
+      el.style.cssText =
+        'position:absolute;z-index:40;border:1.5px dashed #16a34a;background:rgba(22,163,74,.06);pointer-events:none'
+      this.container.appendChild(el)
+      this.marquee3d = { x0: e.clientX, y0: e.clientY, el }
       return
     }
     // オブジェクトを掴んだ: カメラを回さない(capture で controls より先に止める)
@@ -853,6 +926,7 @@ export class View3D {
       this.drillPending = hit.id
     } else if (!already) {
       this.onSelect(hit.id, hit.level, 'replace')
+      this.faceSel = null
     }
     this.highlightSelection()
     const movable = this.store.byId(hit.id)
@@ -862,6 +936,16 @@ export class View3D {
       this.store.commit()
       this.openingDrag = { id: hit.id, level: hit.level }
       return
+    }
+    // 面選択中: そのオブジェクトのドラッグは移動ではなく「選択した面のプッシュ / プル」
+    if (this.faceSel?.id === hit.id) {
+      this.startGizmoDrag(movable, this.faceSel.kind, hit.point, e.pointerId)
+      return
+    }
+    // 単体選択の box 系を再クリック: 動かさなければ面選択(up で確定)
+    if (already && selNow.size === 1 && hit.normal &&
+      (movable.type === 'furniture' || movable.type === 'column' || movable.type === 'custom') && 'rot' in movable) {
+      this.facePending = this.faceKindFromNormal(movable, hit.normal)
     }
     this.store.commit()
     // 掴んで動かす = 常に平面移動(高さ変更は青い円錐つまみからのみ)
@@ -919,8 +1003,20 @@ export class View3D {
       this.rulerIcon.style.display = 'none'
       this.measureLive.visible = false
     }
-    // 基準点複写: 基準点の選択待ちは十字カーソル
-    if (this.getDupAwait()) this.renderer.domElement.style.cursor = 'crosshair'
+    // 基準点複写: 基準点の選択待ちは十字カーソル + スナップガイド(端点・中点・延長など)
+    if (this.getDupAwait() && this.store) {
+      this.renderer.domElement.style.cursor = 'crosshair'
+      const gp = this.groundPoint(e)
+      if (gp) {
+        const snap = this.getSnapInfo(gp)
+        this.sketchOv.update({
+          camera: this.camera, canvas: this.renderer.domElement,
+          cursor: snap.p, y: this.levelYs[this.store.active] ?? 0, snap
+        })
+        this.render()
+      }
+      return
+    }
     if (this.rotDrag && this.store) {
       const ent = this.store.byId(this.rotDrag.id)
       if (!ent) return
@@ -1003,6 +1099,25 @@ export class View3D {
     if (this.gizmoDrag && this.store) {
       const ent = this.store.byId(this.gizmoDrag.id)
       if (!ent) return
+      if (ent.type === 'sketch' && this.gizmoDrag.kind.startsWith('sv')) {
+        // 端点つまみ: 同じ位置の端点をまとめて移動(2D と同じ)
+        const idx = parseInt(this.gizmoDrag.kind.slice(2), 10)
+        const v = this.sketchVerts(ent)[idx]
+        if (!v) return
+        const yBase = this.levelYs[this.store.active] ?? 0
+        const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -yBase)
+        const p = new THREE.Vector3()
+        if (!this.ray(e).ray.intersectPlane(plane, p)) return
+        const snapRes = this.getSnapInfo(pt(p.x * 1000, p.z * 1000))
+        const q = snapRes.p
+        const cur = { ...v }
+        for (const ed of ent.edges) {
+          if (dist(ed.a, cur) < 3) ed.a = { ...q }
+          if (dist(ed.b, cur) < 3) ed.b = { ...q }
+        }
+        this.rebuildSoon()
+        return
+      }
       if (ent.type === 'sketch' && this.gizmoDrag.kind.startsWith('sf')) {
         // 面の円錐つまみ: 上下ドラッグで押し出し高さ(0 = 平面に戻る)
         const idx = parseInt(this.gizmoDrag.kind.slice(2), 10)
@@ -1066,7 +1181,7 @@ export class View3D {
       if (ent.type !== 'furniture' && ent.type !== 'column' && ent.type !== 'custom') return
       const snap = 50 // サイズ変更は 50mm 刻み
       const k = this.gizmoDrag.kind
-      if (k.startsWith('ex') || k.startsWith('ez') || k === 'corner') {
+      if (k.startsWith('ex') || k.startsWith('ez') || k.startsWith('c')) {
         // 水平面との交点をローカル座標へ
         const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -this.gizmoDrag.grabY)
         const p = new THREE.Vector3()
@@ -1074,13 +1189,17 @@ export class View3D {
         const lx = (p.x - ent.pos.x * M) * 1000, lz = (p.z - ent.pos.y * M) * 1000
         const cos = Math.cos(ent.rot), sin = Math.sin(ent.rot)
         const local = { x: lx * cos + lz * sin, y: -lx * sin + lz * cos }
-        if (k === 'corner') {
-          // 四隅: 全体スケール(中心固定で W/D/H を等倍)。既定寸法で一瞬止まる
-          const dd = defaultDims(ent)
-          const f = Math.hypot(p.x - ent.pos.x * M, p.z - ent.pos.y * M) / (this.gizmoDrag.startDist ?? 1)
-          ent.w = Math.max(50, detent(snapTo((this.gizmoDrag.startW ?? ent.w) * f, snap), dd.w))
-          ent.d = Math.max(50, detent(snapTo((this.gizmoDrag.startD ?? ent.d) * f, snap), dd.d))
-          ent.h = Math.max(50, detent(snapTo((this.gizmoDrag.startH ?? ent.h) * f, snap), dd.h))
+        if (k.startsWith('c')) {
+          // 四隅: 反対の角を固定したまま幅・奥行を変更(2D と同じ)
+          const sx = k[1] === 'p' ? 1 : -1
+          const sz = k[2] === 'p' ? 1 : -1
+          const ax = (-sx * ent.w) / 2, ay = (-sz * ent.d) / 2
+          const w = Math.max(50, snapTo(Math.abs(local.x - ax), snap))
+          const d = Math.max(50, snapTo(Math.abs(local.y - ay), snap))
+          const cLocal = { x: ax + (sx * w) / 2, y: ay + (sz * d) / 2 }
+          const dxm = cLocal.x, dym = cLocal.y
+          ent.pos = pt(ent.pos.x + dxm * cos - dym * sin, ent.pos.y + dxm * sin + dym * cos)
+          ent.w = w; ent.d = d
         } else {
           // 四辺: その辺に平行な方向へ伸縮(反対の辺を固定)
           const axis = k[1] === 'x' ? 'x' : 'y'
@@ -1199,6 +1318,7 @@ export class View3D {
           for (const child of g.children) {
             const id = child.userData.entId as string | undefined
             if (!id) continue
+            if ((child.userData.level as number) !== this.store.active) continue // 編集中の階のみ
             bb.setFromObject(child)
             if (bb.isEmpty()) continue
             bb.getCenter(c)
@@ -1209,6 +1329,11 @@ export class View3D {
           }
         }
         this.onSelectSet([...ids])
+        this.highlightSelection()
+      } else {
+        // ドラッグせずクリック → 空クリック扱いで選択解除
+        this.onSelect('', this.store.active, 'replace')
+        this.faceSel = null
         this.highlightSelection()
       }
       return
@@ -1233,6 +1358,19 @@ export class View3D {
         this.onSelect(this.drillPending, this.store.active, 'drill')
         this.highlightSelection()
       }
+      if (!wasDrag && this.facePending && this.store) {
+        // クリック(動かさない)→ 面を選択(次のドラッグでその面だけ伸縮)
+        const sel = [...this.getSelection()]
+        if (sel.length === 1) {
+          this.faceSel = this.faceSel?.kind === this.facePending && this.faceSel.id === sel[0]
+            ? null // 同じ面の再クリックで解除
+            : { id: sel[0], kind: this.facePending }
+          this.onMeasure(this.faceSel
+            ? '面を選択しました: この面をドラッグすると、その面だけが伸縮します(もう一度クリックで解除)'
+            : '')
+        }
+      }
+      this.facePending = null
       this.drillPending = null
       this.dragging = null
       this.heightDrag = null
@@ -1371,7 +1509,7 @@ export class View3D {
     this.previewPole.visible = false
     this.previewLine.visible = false
     this.previewCustom.visible = false
-    if (tool !== 'room' && tool !== 'dimension' && tool !== 'pencil') this.sketchOv.hide()
+    if (tool !== 'room' && tool !== 'dimension' && tool !== 'pencil' && tool !== 'component') this.sketchOv.hide()
     const info = this.getPreview()
 
     if (tool === 'door' || tool === 'window') {
@@ -1428,6 +1566,35 @@ export class View3D {
           camera: this.camera, canvas: this.renderer.domElement,
           cursor: cur, y: yBase, pts, rectStart, snap, axis,
           mode: tool === 'dimension' ? null : this.getDrawMode()
+        })
+      }
+    } else if (tool === 'component' && this.getComponentDef()) {
+      // コンポーネント(複写含む): 全エンティティの半透明ゴースト + スナップガイド
+      const gp = this.groundPoint(e)
+      const def = this.getComponentDef()!
+      if (gp) {
+        const snap = this.getSnapInfo(gp)
+        const at = snap.p
+        if (this.ghostDefRef !== def) {
+          // 定義が変わったときだけ再構築(基準点相対の座標のまま作り、位置はグループ移動)
+          this.ghostDefRef = def
+          this.previewCustom.traverse(o => { if (o instanceof THREE.Mesh) o.geometry.dispose() })
+          this.previewCustom.clear()
+          const prevTarget = this.target
+          const prevIdx = this.levelIdx
+          this.target = this.previewCustom
+          this.levelIdx = this.store.active
+          this.buildLevel(def)
+          this.target = prevTarget
+          this.levelIdx = prevIdx
+          this.previewCustom.traverse(o => { if (o instanceof THREE.Mesh) o.material = PREVIEW_MAT })
+        }
+        this.previewCustom.position.set(at.x * M, yBase, at.y * M)
+        this.previewCustom.rotation.y = -this.getPlaceRot()
+        this.previewCustom.visible = true
+        this.sketchOv.update({
+          camera: this.camera, canvas: this.renderer.domElement,
+          cursor: at, y: yBase, snap
         })
       }
     } else if (info) {
