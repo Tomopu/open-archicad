@@ -39,6 +39,8 @@ export interface OverlayState {
   dims?: { text: string; at: Pt }[]
   /** 鉛筆 / 長方形のモードアイコン(2D と同じ)。undefined で非表示 */
   mode?: 'poly' | 'rect' | null
+  /** 十字カーソルの腕の長さ mm(既定 120。部品スタジオは小さめ) */
+  crossMm?: number
 }
 
 const BLUE = 0x2563eb
@@ -149,7 +151,7 @@ export class SketchOverlay {
     const y = o.y + 0.012
     const c = o.cursor
     // 十字カーソル(小さめ・太め)
-    const s = 120 // mm
+    const s = o.crossMm ?? 120 // mm
     this.crossMat.color.setHex(o.color ?? BLUE)
     this.setLine(this.crossA, [this.toV(pt(c.x - s, c.y), y), this.toV(pt(c.x + s, c.y), y)])
     this.setLine(this.crossB, [this.toV(pt(c.x, c.y - s), y), this.toV(pt(c.x, c.y + s), y)])

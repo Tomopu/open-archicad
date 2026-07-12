@@ -50,6 +50,8 @@ tm.onToolChange = t => {
     b.dataset.tool === t || (b.dataset.tool === 'furniture' && t === 'equipment'))) // 家具/設備は統合ボタン
   document.querySelectorAll('.comp-item').forEach(el => el.classList.toggle('active', t === 'component'))
   renderToolOptions()
+  view3d?.hidePreview() // ツールを切り替えたら 3D の十字・ライブ線を即座に消す
+  updateLenBox()
 }
 
 // ================= フォーム部品 =================
@@ -663,15 +665,43 @@ tm.onDupBase = base => {
   tm.placeComponent(def)
 }
 tm.onSelectionChange = () => { renderProperties(); renderObjectList() }
-// 部屋・文字のダブルクリックで名前(内容)を直接編集
+// 部屋・文字のダブルクリック: キャンバス上にその場でテキスト入力(ポップアップなし)
 tm.onRename = ent => {
-  if (ent.type === 'room') {
-    const v = prompt('部屋の名前', ent.name)
-    if (v) { store.commit(); ent.name = v; store.emit(); renderProperties() }
-  } else if (ent.type === 'label') {
-    const v = prompt('テキスト', ent.text)
-    if (v) { store.commit(); ent.text = v; store.emit(); renderProperties() }
+  if (ent.type !== 'room' && ent.type !== 'label') return
+  const cur = ent.type === 'room' ? ent.name : ent.text
+  const walls = new Map<string, import('./model').Wall>()
+  for (const en of store.doc.entities) if (en.type === 'wall') walls.set(en.id, en)
+  const b = renderer.entityBounds(ent, walls)
+  if (!b) return
+  const s = renderer.vp.toScreen({ x: (b.min.x + b.max.x) / 2, y: (b.min.y + b.max.y) / 2 })
+  const input = document.createElement('input')
+  input.type = 'text'
+  input.value = cur
+  input.className = 'canvas-rename'
+  input.style.left = `${s.x}px`
+  input.style.top = `${s.y}px`
+  let done = false
+  const finish = (ok: boolean): void => {
+    if (done) return
+    done = true
+    if (ok && input.value.trim() && input.value !== cur) {
+      store.commit()
+      if (ent.type === 'room') ent.name = input.value.trim()
+      else ent.text = input.value.trim()
+      store.emit()
+      renderProperties()
+    }
+    input.remove()
   }
+  input.onkeydown = ev => {
+    ev.stopPropagation()
+    if (ev.key === 'Enter') { ev.preventDefault(); finish(true) }
+    else if (ev.key === 'Escape') finish(false)
+  }
+  input.onblur = () => finish(true)
+  $('#canvas-area').appendChild(input)
+  input.focus()
+  input.select()
 }
 
 // ================= プロジェクト設定 =================
@@ -900,10 +930,7 @@ function selectAndSync(): void {
   renderer.requestDraw()
   if (!$('#view3d').hidden) view3d?.highlightSelection()
 }
-function renameEntity(e: Entity): void {
-  const cur = entLabel(e)
-  const v = prompt('名前を変更', cur)
-  if (!v || v === cur) return
+function setEntityName(e: Entity, v: string): void {
   store.commit()
   if (e.type === 'room') e.name = v
   else if (e.type === 'label') e.text = v
@@ -911,8 +938,37 @@ function renameEntity(e: Entity): void {
   else e.dispName = v
   store.emit()
 }
+/** その場で名前をテキスト入力に変える(ポップアップなし) */
+function inlineEdit(target: HTMLElement, cur: string, commit: (v: string) => void): void {
+  const input = document.createElement('input')
+  input.type = 'text'
+  input.value = cur
+  input.className = 'inline-rename'
+  let done = false
+  const finish = (ok: boolean): void => {
+    if (done) return
+    done = true
+    if (ok && input.value.trim() && input.value !== cur) commit(input.value.trim())
+    input.onblur = null
+    input.remove() // フォーカスガードに残らないよう明示的に除去してから再構築
+    objListSig = ''
+    renderObjectList()
+  }
+  input.onkeydown = ev => {
+    ev.stopPropagation()
+    if (ev.key === 'Enter') { ev.preventDefault(); finish(true) }
+    else if (ev.key === 'Escape') finish(false)
+  }
+  input.onblur = () => finish(true)
+  input.onclick = ev => ev.stopPropagation()
+  input.onpointerdown = ev => ev.stopPropagation()
+  target.replaceWith(input)
+  input.focus()
+  input.select()
+}
 
 function renderObjectList(): void {
+  if (objListEl.contains(document.activeElement)) return // リネーム入力中は再構築しない
   const ents = store.doc.entities
   const gNames = store.doc.meta.groupNames ?? {}
   const sig = ents.map(e => `${e.id}${e.hidden ? 'h' : ''}${e.group ?? ''}${renderer.selection.has(e.id) ? 's' : ''}${entLabel(e)}`).join('|')
@@ -943,6 +999,13 @@ function renderObjectList(): void {
     name.className = 'name'
     name.textContent = entLabel(e)
     if (e.hidden) name.style.opacity = '0.45'
+    // 選択済みブロックの名前をクリック → その場でテキスト入力に(アイコン類では発動しない)
+    name.onclick = ev => {
+      if (renderer.selection.has(e.id) && renderer.selection.size === 1) {
+        ev.stopPropagation()
+        inlineEdit(name, entLabel(e), v => setEntityName(e, v))
+      }
+    }
     row.appendChild(name)
     row.onclick = ev => {
       if (ev.shiftKey && objAnchor >= 0) {
@@ -958,7 +1021,6 @@ function renderObjectList(): void {
       }
       selectAndSync()
     }
-    row.ondblclick = () => renameEntity(e)
     return row
   }
   // グループ → ブロック化(初出のグループ位置に、ヘッダ + インデントした子)
@@ -998,6 +1060,17 @@ function renderObjectList(): void {
     const gname = document.createElement('span')
     gname.className = 'name'
     gname.textContent = `${gNames[gid] ?? 'グループ'} (${members.length})`
+    // 選択済みのグループ名をクリック → その場でリネーム
+    gname.onclick = ev => {
+      if (members.every(m => renderer.selection.has(m.id))) {
+        ev.stopPropagation()
+        inlineEdit(gname, gNames[gid] ?? 'グループ', v => {
+          store.commit()
+          store.doc.meta.groupNames = { ...gNames, [gid]: v }
+          store.emit()
+        })
+      }
+    }
     head.appendChild(gname)
     // グループ解除
     const un = document.createElement('button')
@@ -1017,13 +1090,6 @@ function renderObjectList(): void {
       renderer.selection.clear()
       for (const m of members) renderer.selection.add(m.id)
       selectAndSync()
-    }
-    head.ondblclick = () => {
-      const v = prompt('グループ名', gNames[gid] ?? 'グループ')
-      if (!v) return
-      store.commit()
-      store.doc.meta.groupNames = { ...gNames, [gid]: v }
-      store.emit()
     }
     objListEl.appendChild(head)
     if (!collapsed) for (const m of members) objListEl.appendChild(rowOf(m, true))
@@ -1763,6 +1829,26 @@ tm.onZoom = z => {
   $('#st-zoom').textContent = `1mm = ${z.toFixed(3)}px`
   updateScaleBar()
 }
+// 長さ入力ボックス: 鉛筆・部屋の作図中に数値 + Enter でその長さ(mm)の辺を確定
+const lenWrap = $('#st-len-wrap')
+const lenBox = $('#st-len') as HTMLInputElement
+function updateLenBox(): void {
+  lenWrap.hidden = !(tm.tool === 'pencil' || tm.tool === 'room')
+}
+lenBox.addEventListener('keydown', e => {
+  e.stopPropagation() // ツールのショートカットに奪われない
+  if (e.key === 'Enter') {
+    e.preventDefault()
+    const v = parseFloat(lenBox.value)
+    tm.applyLengthInput(v)
+    lenBox.value = ''
+  } else if (e.key === 'Escape') {
+    lenBox.value = ''
+    lenBox.blur()
+  }
+})
+// キャンバスで直接タイプした数値もボックスに同期表示
+tm.onNumBuf = s => { if (document.activeElement !== lenBox) lenBox.value = s }
 ;($('#st-snap') as HTMLSelectElement).onchange = e => { tm.snapStep = parseFloat((e.target as HTMLSelectElement).value) || 0 }
 ;($('#st-grid') as HTMLInputElement).onchange = e => {
   renderer.showGrid = (e.target as HTMLInputElement).checked

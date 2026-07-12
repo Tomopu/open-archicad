@@ -121,6 +121,18 @@ export class ToolManager {
   setCursorHint(p: Pt): void { this.cursor = p }
   /** 数値入力バッファ(3D 側での表示用) */
   get numBuffer(): string { return this.numBuf }
+  /** 数値バッファの変更通知(ステータスバーの長さボックスと同期) */
+  onNumBuf: (s: string) => void = () => {}
+  private setNumBuf(v: string): void {
+    this.numBuf = v
+    this.onNumBuf(v)
+  }
+  /** ステータスバーの長さボックスからの確定(鉛筆・部屋の作図中) */
+  applyLengthInput(v: number): void {
+    if (!(v > 0)) return
+    this.setNumBuf(String(v))
+    this.applyNumBuf()
+  }
   private panning = false
   private panStart: Pt = pt(0, 0)
   private panView: Pt = pt(0, 0)
@@ -255,7 +267,7 @@ export class ToolManager {
   setTool(t: ToolName): void {
     this.tool = t
     this.wallStart = null; this.dimPts = []; this.roomPts = []
-    this.rectStart = null; this.penPts = []; this.penTarget = null; this.numBuf = ''
+    this.rectStart = null; this.penPts = []; this.penTarget = null; this.setNumBuf('')
     if (t !== 'component') { this.placingComponent = null; this.dupFrom = null; this.dupAwaitBase = false }
     this.setSketchSub(null)
     this.sketchLocked = false
@@ -902,7 +914,7 @@ export class ToolManager {
 
   cancel(): void {
     this.wallStart = null; this.arcEnd = null; this.dimPts = []; this.roomPts = []
-    this.rectStart = null; this.penPts = []; this.penTarget = null; this.numBuf = ''
+    this.rectStart = null; this.penPts = []; this.penTarget = null; this.setNumBuf('')
     this.dupAwaitBase = false; this.dupFrom = null
     this.elevWallStart = null
     this.updateCursor()
@@ -916,7 +928,7 @@ export class ToolManager {
    * 取り消すものがなければ false(通常の Undo に委ねる)
    */
   undoDraft(): boolean {
-    if (this.numBuf) { this.numBuf = ''; this.r.requestDraw(); return true }
+    if (this.numBuf) { this.setNumBuf(''); this.r.requestDraw(); return true }
     if (this.rectStart) { this.rectStart = null; this.r.requestDraw(); return true }
     if (this.tool === 'wall' && (this.wallStart || this.arcEnd)) {
       this.arcEnd = null; this.wallStart = null
@@ -970,7 +982,7 @@ export class ToolManager {
   /** 数値入力バッファ(部屋・鉛筆の寸法指定)を確定 */
   private applyNumBuf(): void {
     const buf = this.numBuf
-    this.numBuf = ''
+    this.setNumBuf('')
     if (!buf) return
     const nums = buf.split(/[,xX]/).map(s => parseFloat(s)).filter(v => !Number.isNaN(v) && v > 0)
     if (!nums.length) return
@@ -1028,12 +1040,12 @@ export class ToolManager {
     if ((this.tool === 'room' || this.tool === 'pencil') &&
       (this.rectStart || this.penPts.length || this.roomPts.length)) {
       if (/^[0-9.,]$/.test(e.key) || (e.key.toLowerCase() === 'x' && this.numBuf)) {
-        this.numBuf += e.key
+        this.setNumBuf(this.numBuf + e.key)
         this.r.requestDraw()
         return
       }
       if (e.key === 'Backspace' && this.numBuf) {
-        this.numBuf = this.numBuf.slice(0, -1)
+        this.setNumBuf(this.numBuf.slice(0, -1))
         this.r.requestDraw()
         return
       }

@@ -13,6 +13,9 @@ type PartKind = 'box' | 'cyl' | 'sphere' | 'cone' | 'poly' | 'baked'
 export interface StudioPart {
   kind: PartKind
   op: 'add' | 'sub'
+  /** オブジェクト一覧での表示名(リネーム可能)と表示 / 非表示 */
+  name?: string
+  hidden?: boolean
   x: number; y: number; z: number      // 位置 mm(y は底面高さ)
   sx: number; sy: number; sz: number   // 寸法 mm
   rot: number                          // Y軸回転(度)
@@ -77,6 +80,7 @@ function csgOf(parts: StudioPart[], mode: 'recipe' | 'union' | 'subtract' | 'int
   const ev = new Evaluator()
   let acc: Brush | null = null
   for (const p of parts) {
+    if (p.hidden) continue // 非表示のオブジェクトは演算から除外
     // 厚さ 0 の平面はそのままではブール演算できないため、演算時のみ 2mm の薄板にする
     const geoPart = p.kind === 'poly' && p.sy < 1 ? { ...p, sy: 2 } : p
     const brush = new Brush(partGeometry(geoPart))
@@ -169,7 +173,7 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
         <div class="studio-hint">クリック: 選択 / Shift+クリック: 追加選択 / ドラッグ: 移動 / 紫球: 高さ / 赤=くり抜き / 鉛筆: 地面をクリックして多角形(ダブルクリックで閉じる、2点なら長方形)</div>
       </div>
       <div class="studio-side">
-        <div class="panel-title">パーツ一覧</div>
+        <div class="panel-title">オブジェクト一覧</div>
         <div class="studio-parts"></div>
         <div class="panel-title">選択中のパーツ</div>
         <div class="studio-fields props"></div>
@@ -494,6 +498,7 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
     parts.forEach((p, i) => {
       const mesh = new THREE.Mesh(partGeometry(p), selSet.has(i) ? MAT_SEL : p.op === 'add' ? MAT_ADD : MAT_SUB)
       mesh.userData.idx = i
+      mesh.visible = !p.hidden
       partsGroup.add(mesh)
     })
     partsGroup.visible = !previewing
@@ -517,23 +522,88 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
     partsGroup.visible = true
   }
 
-  // ---------- UI: パーツ一覧・フィールド ----------
+  // ---------- UI: オブジェクト一覧(3D モードと同等: 表示切替・リネーム・Shift 範囲選択)・フィールド ----------
   const listEl = modal.querySelector('.studio-parts') as HTMLElement
   const fieldsEl = modal.querySelector('.studio-fields') as HTMLElement
+  const EYE_ON = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M2 12c1-2.5 5-7 10-7s9 4.5 10 7c-1 2.5-5 7-10 7S3 14.5 2 12z"/><circle cx="12" cy="12" r="3"/></svg>'
+  const EYE_OFF = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 3l18 18M10.5 5.2A9.8 9.8 0 0 1 12 5c5 0 9 4.5 10 7-.4 1-1.3 2.4-2.6 3.7M6.6 6.6C4.1 8.1 2.5 10.5 2 12c1 2.5 5 7 10 7 1.6 0 3.1-.5 4.4-1.2"/></svg>'
+  let listAnchor = -1 // Shift 範囲選択の起点
+  const partLabel = (p: StudioPart): string =>
+    p.name ?? `${KIND_LABEL[p.kind]}${p.op === 'sub' ? '(くり抜き)' : ''}`
   const renderList = (): void => {
+    if (listEl.contains(document.activeElement)) return // リネーム入力中は再構築しない
     listEl.innerHTML = ''
     parts.forEach((p, i) => {
       const row = document.createElement('div')
-      row.className = 'comp-item' + (selSet.has(i) ? ' active' : '')
-      row.innerHTML = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.5">${KIND_ICON[p.kind]}</svg>
-        <span class="name">${KIND_LABEL[p.kind]}${p.op === 'sub' ? '(くり抜き)' : ''}</span>`
+      row.className = 'comp-item obj-row' + (selSet.has(i) ? ' active' : '')
+      // 表示 / 非表示(目のアイコン)
+      const eye = document.createElement('button')
+      eye.className = 'obj-eye' + (p.hidden ? ' off' : '')
+      eye.title = p.hidden ? '表示する' : '非表示にする(CSG 演算からも除外)'
+      eye.innerHTML = p.hidden ? EYE_OFF : EYE_ON
+      eye.onclick = ev => {
+        ev.stopPropagation()
+        p.hidden = !p.hidden || undefined
+        if (p.hidden) selSet.delete(i)
+        exitPreview()
+        rebuildParts()
+        renderList()
+      }
+      row.appendChild(eye)
+      const icon = document.createElement('span')
+      icon.innerHTML = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.5">${KIND_ICON[p.kind]}</svg>`
+      row.appendChild(icon)
+      const name = document.createElement('span')
+      name.className = 'name'
+      name.textContent = partLabel(p)
+      if (p.hidden) name.style.opacity = '0.45'
+      // 選択済みブロックの名前クリック → その場でリネーム(ポップアップなし)
+      name.onclick = ev => {
+        if (selSet.has(i) && selSet.size === 1) {
+          ev.stopPropagation()
+          const input = document.createElement('input')
+          input.type = 'text'
+          input.value = partLabel(p)
+          input.className = 'inline-rename'
+          let doneFlag = false
+          const finish = (ok: boolean): void => {
+            if (doneFlag) return
+            doneFlag = true
+            if (ok && input.value.trim()) p.name = input.value.trim()
+            input.onblur = null
+            input.remove()
+            renderList()
+          }
+          input.onkeydown = kev => {
+            kev.stopPropagation()
+            if (kev.key === 'Enter') { kev.preventDefault(); finish(true) }
+            else if (kev.key === 'Escape') finish(false)
+          }
+          input.onblur = () => finish(true)
+          input.onclick = kev => kev.stopPropagation()
+          input.onpointerdown = kev => kev.stopPropagation()
+          name.replaceWith(input)
+          input.focus()
+          input.select()
+        }
+      }
+      row.appendChild(name)
       row.onclick = ev => {
-        if (ev.shiftKey) { if (selSet.has(i)) selSet.delete(i); else selSet.add(i) }
-        else { selSet.clear(); selSet.add(i) }
+        if (ev.shiftKey && listAnchor >= 0) {
+          // 範囲選択: 起点から今回の行まで
+          const [a, b] = [Math.min(listAnchor, i), Math.max(listAnchor, i)]
+          selSet.clear()
+          for (let k = a; k <= b; k++) selSet.add(k)
+        } else {
+          selSet.clear()
+          selSet.add(i)
+          listAnchor = i
+        }
         refresh()
       }
       const del = document.createElement('button')
       del.textContent = '×'
+      del.title = '削除'
       del.onclick = ev => {
         ev.stopPropagation()
         parts.splice(i, 1)
@@ -601,6 +671,21 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
       return
     }
     if (e.type !== 'keydown') return
+    // ⌘Z: 鉛筆で引いている途中の線を 1 本戻す(即時反映)
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z' && penMode) {
+      e.preventDefault()
+      if (penPts.length) penPts.pop()
+      else if (penRectStart) penRectStart = null
+      if (penHover) {
+        sketchOv.update({
+          camera, canvas: renderer.domElement,
+          cursor: penHover, y: 0, pts: penPts, rectStart: penRectStart,
+          snap: { p: penHover, kind: null, guides: [] }, mode: params.pencil.mode, crossMm: 60
+        })
+      }
+      render()
+      return
+    }
     // 鉛筆(線)モード: 2 点目以降は数値 + Enter で長さ指定
     if (penMode && params.pencil.mode === 'poly' && penPts.length) {
       if (/^[0-9.]$/.test(e.key)) { numBuf += e.key; return }
@@ -881,7 +966,7 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
         const snap = studioSnap(gp)
         sketchOv.update({
           camera, canvas: renderer.domElement,
-          cursor: snap.p, y: 0, snap
+          cursor: snap.p, y: 0, snap, crossMm: 60
         })
         if (dupState.base) {
           dupGhost.position.set((snap.p.x - dupState.base.x) * MM, 0, (snap.p.y - dupState.base.y) * MM)
@@ -898,7 +983,8 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
           camera, canvas: renderer.domElement,
           cursor: pc.cur, y: 0, pts: penPts, rectStart: penRectStart,
           snap: pc.snap, axis: pc.axis, mode: params.pencil.mode,
-          dims: numBuf ? [{ text: `${numBuf} ⏎`, at: pc.cur }] : undefined
+          dims: numBuf ? [{ text: `${numBuf} ⏎`, at: pc.cur }] : undefined,
+          crossMm: 60
         })
         render()
       }

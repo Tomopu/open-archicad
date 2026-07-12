@@ -146,6 +146,9 @@
       <label title="壁厚の自動表記 (t=120)"><input type="checkbox" id="st-wallt" checked> 壁厚</label>
       <button id="st-guides" title="スナップガイド(端点・中点・延長など)の有効 / 無効">ガイド ▾</button>
       <span class="spacer"></span>
+      <label id="st-len-wrap" title="鉛筆・部屋で線を引いている最中に数値を入れて Enter → その長さ(mm)で確定" hidden>
+        長さ <input type="number" id="st-len" min="1" step="10" style="width:70px"> mm
+      </label>
       <span id="st-zoom">100%</span>
       <span id="st-msg"></span>
     </footer>

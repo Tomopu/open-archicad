@@ -263,6 +263,8 @@ export class View3D {
   private gizmoDrag: {
     kind: string; id: string; grabY: number; startElev: number; startPtY: number
     startW?: number; startD?: number; startH?: number; startDist?: number
+    /** スケッチ頂点つまみ: 差分移動用の始点(初回 move で確定) */
+    startVert?: Pt; startGround?: Pt
   } | null = null
   private gizmo = new THREE.Group()
   /** 回転モード(⟳ アイコンでトグル): XYZ の回転リングを表示 */
@@ -330,6 +332,8 @@ export class View3D {
   onPlanCursor: (p: Pt) => void = () => {}
   /** 数値入力バッファ(青ラベルで表示) */
   getNumBuf: () => string = () => ''
+  /** 直近のポインタ位置(Undo 直後などにオーバーレイを即時再描画するため) */
+  private lastMoveEv: { clientX: number; clientY: number } | null = null
   /** 共通の作図オーバーレイ(十字カーソル・ライブ線・ガイド・青寸法) */
   private sketchOv: SketchOverlay
   /** 直近の作図カーソル(スナップ・軸ロック済み)。クリック配置に使う */
@@ -846,13 +850,11 @@ export class View3D {
       : this.getTool() === 'pencil' ? CURSOR_PENCIL
       : this.getDupAwait() ? 'crosshair' : ''
   }
-  /** 選択ツール中: 左ドラッグ = 範囲選択、回転は右ドラッグへ(Space 中・他ツールは左 = 回転) */
+  /** 左ドラッグ = 視点移動(従来どおり)。範囲選択は Shift+ドラッグ */
   private syncControlButtons(): void {
-    const sel = this.getTool() === 'select' && !this.spaceOn
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    ;(this.controls as any).mouseButtons = sel
-      ? { LEFT: null, MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.ROTATE }
-      : { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN }
+    ;(this.controls as any).mouseButtons =
+      { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN }
   }
 
   private pointerDown(e: PointerEvent): void {
@@ -923,14 +925,16 @@ export class View3D {
     // 選択は編集中の階のオブジェクトのみ(1F 編集中は 1F だけ選べる)
     const hit = this.pick(e, true)
     if (!hit) {
-      // 空ドラッグ → 範囲選択(緑の点線)。カメラ回転は右ドラッグ
-      e.stopPropagation()
-      this.controls.enabled = false
-      const el = document.createElement('div')
-      el.style.cssText =
-        'position:absolute;z-index:40;border:1.5px dashed #16a34a;background:rgba(22,163,74,.06);pointer-events:none'
-      this.container.appendChild(el)
-      this.marquee3d = { x0: e.clientX, y0: e.clientY, el }
+      // Shift+空ドラッグ → 範囲選択(緑の点線)。通常の左ドラッグは視点移動のまま
+      if (e.shiftKey) {
+        e.stopPropagation()
+        this.controls.enabled = false
+        const el = document.createElement('div')
+        el.style.cssText =
+          'position:absolute;z-index:40;border:1.5px dashed #16a34a;background:rgba(22,163,74,.06);pointer-events:none'
+        this.container.appendChild(el)
+        this.marquee3d = { x0: e.clientX, y0: e.clientY, el }
+      }
       return
     }
     // オブジェクトを掴んだ: カメラを回さない(capture で controls より先に止める)
@@ -988,6 +992,7 @@ export class View3D {
   }
 
   private pointerMove(e: PointerEvent): void {
+    this.lastMoveEv = { clientX: e.clientX, clientY: e.clientY }
     // 計測モード: オレンジの十字カーソル + メジャーアイコン + ライブ距離
     if (this.measureOn && this.store) {
       const r = this.container.getBoundingClientRect()
@@ -1124,17 +1129,30 @@ export class View3D {
       const ent = this.store.byId(this.gizmoDrag.id)
       if (!ent) return
       if (ent.type === 'sketch' && this.gizmoDrag.kind.startsWith('sv')) {
-        // 端点つまみ: 同じ位置の端点をまとめて移動(2D と同じ)
+        // 端点つまみ: つまんだ位置からの差分で移動(絶対位置に飛ばない = ワープ防止)。
+        // 同じ位置の端点はまとめて動かす(2D と同じ)
         const idx = parseInt(this.gizmoDrag.kind.slice(2), 10)
-        const v = this.sketchVerts(ent)[idx]
-        if (!v) return
         const yBase = this.levelYs[this.store.active] ?? 0
         const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -yBase)
         const p = new THREE.Vector3()
         if (!this.ray(e).ray.intersectPlane(plane, p)) return
-        const snapRes = this.getSnapInfo(pt(p.x * 1000, p.z * 1000))
-        const q = snapRes.p
-        const cur = { ...v }
+        const ground = pt(p.x * 1000, p.z * 1000)
+        if (!this.gizmoDrag.startVert) {
+          const v = this.sketchVerts(ent)[idx]
+          if (!v) return
+          this.gizmoDrag.startVert = { ...v }
+          this.gizmoDrag.startGround = ground
+          return
+        }
+        const sv = this.gizmoDrag.startVert
+        const sg = this.gizmoDrag.startGround!
+        const q = pt(
+          snapTo(sv.x + ground.x - sg.x, 10),
+          snapTo(sv.y + ground.y - sg.y, 10)
+        )
+        // 現在の頂点位置(前回の移動先)を基準に一致する端点を動かす
+        const curV = this.sketchVerts(ent)[idx] ?? sv
+        const cur = { ...curV }
         for (const ed of ent.edges) {
           if (dist(ed.a, cur) < 3) ed.a = { ...q }
           if (dist(ed.b, cur) < 3) ed.b = { ...q }
@@ -1733,6 +1751,10 @@ export class View3D {
       }
     }
     this.highlightSelection() // render も行う
+    // 作図中のライブ線・十字を即時更新(Undo 直後などの反映遅れ防止)
+    if (this.lastMoveEv && !this.dragging && !this.gizmoDrag && !this.openingDrag) {
+      this.updatePreview(this.lastMoveEv as PointerEvent)
+    }
   }
   private didFitCamera = false
 
