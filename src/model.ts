@@ -79,13 +79,17 @@ export interface DimensionE {
 export interface LabelE { id: string; type: 'label'; pos: Pt; text: string; size: number; group?: string; hidden?: boolean }
 export interface Room { id: string; type: 'room'; poly: Pt[]; name: string; use: RoomUse; showArea: boolean; material?: string; color?: string; group?: string; hidden?: boolean }
 export interface Planting { id: string; type: 'planting'; pos: Pt; kind: PlantKind; height: number; group?: string; hidden?: boolean }
-/** 鉛筆ツールの線1本。色は辺ごとに設定可能 */
-export interface SketchEdge { a: Pt; b: Pt; color?: string }
+/** 鉛筆の線種(実線・破線・点線・一点鎖線) */
+export type LineStyle = 'solid' | 'dash' | 'dot' | 'dashdot'
+/** 鉛筆ツールの線1本。色・線種は辺ごとに設定可能 */
+export interface SketchEdge { a: Pt; b: Pt; color?: string; style?: LineStyle }
 /** 鉛筆ツールで描いたスケッチ(SketchUp 流)。閉路は自動的に面になる。
  *  faces のキーは面の図心(faceKey)。h=押し出し高さ mm / dead=面を削除(貫通穴) */
 export interface SketchE {
   id: string; type: 'sketch'; edges: SketchEdge[]
   faces?: Record<string, { h?: number; dead?: boolean }>
+  /** 床からの高さ mm(厚さ 0 の平面スケッチを持ち上げる) */
+  z?: number
   group?: string; hidden?: boolean
 }
 /** 部品スタジオ(CSG モデリング)で作成したオリジナル部品 */
@@ -95,6 +99,12 @@ export interface CustomE {
   w0: number; d0: number; h0: number    // ジオメトリの元寸法
   label: string
   symbol: 'rect' | 'round'              // 2D 図面での表示記号
+  /** 多角形フットプリント(スケッチから変換した n 角柱の 2D 記号。中心原点 mm) */
+  symbolPoly?: Pt[]
+  /** 自作の 2D 記号(平面図で作図して取り込んだもの。3D には反映されない) */
+  symbolSketch?: { edges: SketchEdge[]; texts?: { pos: Pt; text: string; size: number }[] }
+  /** 平面図で 3D 部品のフットプリントを半透明表示 */
+  show3d?: boolean
   color?: string; group?: string; elev?: number
   hidden?: boolean
   /** 三角形メッシュの頂点(mm、原点=底面中央) */

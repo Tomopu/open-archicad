@@ -285,6 +285,62 @@ export function strokePerpGuide(pts: Pt[], p: Pt, tol: number): { p: Pt; guide: 
   return { p: foot, guide: { a: o, b: foot } }
 }
 
+/** 単純多角形の三角形分割(耳切り法)。入力は面積が正(反時計回り)であること */
+export function triangulate(poly: Pt[]): [number, number, number][] {
+  const idx = [...Array(poly.length).keys()]
+  const tris: [number, number, number][] = []
+  const cross = (o: Pt, a: Pt, b: Pt): number => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
+  let guard = 0
+  while (idx.length > 3 && guard++ < 2000) {
+    let clipped = false
+    for (let i = 0; i < idx.length; i++) {
+      const i0 = idx[(i + idx.length - 1) % idx.length]
+      const i1 = idx[i]
+      const i2 = idx[(i + 1) % idx.length]
+      const a = poly[i0], b = poly[i1], c = poly[i2]
+      if (cross(a, b, c) <= 0) continue // 凹角は耳ではない
+      let ok = true
+      for (const j of idx) {
+        if (j === i0 || j === i1 || j === i2) continue
+        const q = poly[j]
+        if (cross(a, b, q) >= 0 && cross(b, c, q) >= 0 && cross(c, a, q) >= 0) { ok = false; break }
+      }
+      if (!ok) continue
+      tris.push([i0, i1, i2])
+      idx.splice(i, 1)
+      clipped = true
+      break
+    }
+    if (!clipped) break
+  }
+  if (idx.length === 3) tris.push([idx[0], idx[1], idx[2]])
+  return tris
+}
+
+/**
+ * 多角形 + 高さ → n 角柱の三角形メッシュ(mm、原点 = 底面の bbox 中央)。
+ * スケッチの面を押し出したとき、その場で立体オブジェクト(CustomE)に変換するのに使う。
+ */
+export function prismMesh(poly: Pt[], h: number): { positions: number[]; c: Pt; w: number; d: number } {
+  const pts = polyArea(poly) < 0 ? [...poly].reverse() : [...poly]
+  const b = bbox(pts)
+  const c = pt((b.min.x + b.max.x) / 2, (b.min.y + b.max.y) / 2)
+  const local = pts.map(q => pt(q.x - c.x, q.y - c.y))
+  const tris = triangulate(local)
+  const out: number[] = []
+  const push = (q: Pt, y: number): void => { out.push(q.x, y, q.y) }
+  for (const [i0, i1, i2] of tris) {
+    push(local[i0], 0); push(local[i1], 0); push(local[i2], 0)  // 底面
+    push(local[i0], h); push(local[i2], h); push(local[i1], h)  // 天面
+  }
+  for (let i = 0; i < local.length; i++) {
+    const a = local[i], q = local[(i + 1) % local.length]
+    push(a, 0); push(q, h); push(q, 0)
+    push(a, 0); push(a, h); push(q, h)
+  }
+  return { positions: out, c, w: b.max.x - b.min.x, d: b.max.y - b.min.y }
+}
+
 /** 面の入れ子: parent[i] = i を直接含む面の index(なければ -1) */
 export function faceNesting(faces: Pt[][]): number[] {
   const areas = faces.map(f => Math.abs(polyArea(f)))

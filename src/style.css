@@ -124,14 +124,14 @@ button.active { background: var(--accent-bg); color: var(--accent); border-color
 #canvas2d { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
 #view3d { position: absolute; inset: 0; background: #fff; }
 #view3d canvas { display: block; }
-#view3d-toolbar {
+#view3d-toolbar, .studio-toolbar {
   position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
   z-index: 5; display: flex; gap: 8px; align-items: center;
   background: rgba(255,255,255,.9); border: 1px solid var(--border); border-radius: 8px; padding: 4px 8px;
 }
-#view3d-toolbar .hint { color: var(--text2); }
-#view3d-toolbar .sep { width: 1px; height: 16px; background: var(--border); }
-#view3d-toolbar button.active { background: var(--accent-bg); color: var(--accent); border-color: #bfdbfe; }
+#view3d-toolbar .hint, .studio-toolbar .hint { color: var(--text2); }
+#view3d-toolbar .sep, .studio-toolbar .sep { width: 1px; height: 16px; background: var(--border); }
+#view3d-toolbar button.active, .studio-toolbar button.active { background: var(--accent-bg); color: var(--accent); border-color: #bfdbfe; }
 #hint-bar {
   position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%);
   background: rgba(255,255,255,.92); border: 1px solid var(--border); border-radius: 8px;
@@ -391,3 +391,16 @@ button.active { background: var(--accent-bg); color: var(--accent); border-color
   background: #fff; box-shadow: 0 4px 14px rgba(0,0,0,.15);
 }
 #st-len-wrap[hidden] { display: none; }
+
+/* ---- 部品スタジオ: ツール設定・フッタ・配置モード ---- */
+.st-toolopts { margin-top: 10px; padding: 6px 4px; border-top: 1px solid var(--border); font-size: 11px; display: flex; flex-direction: column; gap: 6px; }
+.st-toolopts .cp-title { font-weight: 600; color: var(--text2); }
+.st-toolopts .field { display: flex; flex-direction: column; gap: 2px; }
+.st-toolopts select, .st-toolopts input { width: 100%; }
+.studio-foot {
+  position: absolute; left: 12px; bottom: 10px; z-index: 21;
+  display: flex; align-items: center; gap: 10px; font-size: 11px; color: var(--text2);
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 5px 10px;
+  box-shadow: 0 2px 8px rgba(0,0,0,.08);
+}
+.studio-rail button.placing { color: var(--accent); border-color: var(--accent); background: var(--accent-bg); }

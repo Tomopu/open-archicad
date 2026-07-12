@@ -48,7 +48,7 @@ for (const t of TOOL_DEFS) {
 tm.onToolChange = t => {
   palette.querySelectorAll('button').forEach(b => b.classList.toggle('active',
     b.dataset.tool === t || (b.dataset.tool === 'furniture' && t === 'equipment'))) // 家具/設備は統合ボタン
-  document.querySelectorAll('.comp-item').forEach(el => el.classList.toggle('active', t === 'component'))
+  if (t !== 'component') { placingCompIdx = -1; renderComponents() }
   renderToolOptions()
   view3d?.hidePreview() // ツールを切り替えたら 3D の十字・ライブ線を即座に消す
   updateLenBox()
@@ -234,7 +234,8 @@ function renderToolOptions(): void {
     )
   } else if (t === 'pencil') {
     toolOptions.append(
-      field('入力モード', select([['poly', '鉛筆(線)'], ['rect', '長方形(2点)']], params.pencil.mode, v => { params.pencil.mode = v; tm.setTool('pencil') }))
+      field('入力モード', select([['poly', '鉛筆(線)'], ['rect', '長方形(2点)']], params.pencil.mode, v => { params.pencil.mode = v; tm.setTool('pencil') })),
+      field('線種', select([['solid', '実線'], ['dash', '破線'], ['dot', '点線'], ['dashdot', '一点鎖線']] as [import('./model').LineStyle, string][], params.pencil.style, v => { params.pencil.style = v }))
     )
     const colorBtn = document.createElement('button')
     colorBtn.className = 'color-swatch-btn'
@@ -592,6 +593,7 @@ function renderProperties(): void {
           const info = faceInfo(e, f)
           propsEl.append(field('押し出し高さ mm', numInput(info.h ?? 0, v => upd(() => {
             tm.setFaceHeight(e.id, f, Math.max(0, v))
+            if (v > 0 && sub.faceIdx !== undefined) tm.finalizeFaceExtrude(e.id, sub.faceIdx) // n 角柱の立体へ変換
           }), 50, 0)))
           const eraseBtn = document.createElement('button')
           eraseBtn.textContent = 'この面を削除(貫通穴)'
@@ -617,6 +619,9 @@ function renderProperties(): void {
           }))
           return btn
         })()))
+        propsEl.append(field('床からの高さ mm', numInput(e.z ?? 0, v => upd(() => {
+          e.z = v > 0 ? v : undefined
+        }), 50, 0)))
         const hint = document.createElement('div')
         hint.className = 'empty'
         hint.textContent = '再クリックで 面 → 閉路 → 辺 と選択を絞り込めます'
@@ -624,17 +629,19 @@ function renderProperties(): void {
       }
       break
     }
-    case 'custom':
+    case 'custom': {
       title.textContent = `部品: ${e.label || '(無題)'}`
       propsEl.append(
         field('ラベル', textInput(e.label, v => upd(() => { e.label = v }))),
         field('記号', select([['rect', '矩形'], ['round', '円']], e.symbol, v => upd(() => { e.symbol = v }))),
+        checkbox('3D部品を透過表示(2D)', !!e.show3d, v => upd(() => { e.show3d = v || undefined })),
         field('幅 mm', numInput(e.w, v => upd(() => { e.w = Math.max(50, v) }))),
         field('奥行 mm', numInput(e.d, v => upd(() => { e.d = Math.max(50, v) }))),
         field('高さ mm', numInput(e.h, v => upd(() => { e.h = Math.max(50, v) }))),
         colorField(e, upd)
       )
       break
+    }
   }
   addDeleteButton()
 }
@@ -852,6 +859,21 @@ objActions.querySelector('[data-act="rotate"]')!.addEventListener('click', () =>
   }
 })
 objActions.querySelector('[data-act="dup"]')!.addEventListener('click', () => beginDup())
+// マージ / くり抜き / 交差(3D の複数選択時のみ)
+const csgBtns = (['union', 'subtract', 'intersect'] as const).map(m => {
+  const b = objActions.querySelector(`[data-act="${m}"]`) as HTMLButtonElement
+  b.addEventListener('click', () => {
+    void (async () => {
+      const v = await ensure3D()
+      const ok = await v.boolOp(m)
+      if (ok) {
+        renderProperties()
+        setMsg(m === 'union' ? 'マージしました' : m === 'subtract' ? 'くり抜きました' : '交差を残しました')
+      }
+    })()
+  })
+  return b
+})
 // 消しゴム: スケッチの面を選択しているときだけ表示
 const eraseBtn = objActions.querySelector('[data-act="erase"]') as HTMLButtonElement
 eraseBtn.addEventListener('click', () => {
@@ -1103,6 +1125,9 @@ function updateObjActions(): void {
   const sub = tm.sketchSub
   eraseBtn.hidden = !(sub && (sub.mode === 'face' || sub.mode === 'loop') &&
     sub.faceIdx !== undefined && renderer.selection.has(sub.id))
+  // CSG ボタンは 3D 表示中の複数選択のみ
+  const csgOk = !$('#view3d').hidden && ids.length >= 2
+  for (const b of csgBtns) b.hidden = !csgOk
   // 3D モード: 選択メッシュのバウンディングボックス上端に表示
   if (!$('#view3d').hidden) {
     const p = view3d?.projectSelection(renderer.selection)
@@ -1340,6 +1365,10 @@ const esc = (s: string): string => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<
 // ================= コンポーネント =================
 let components: ComponentDef[] = loadComponents()
 const compChecked = new Set<number>()
+/** 配置中のコンポーネント(そのブロックだけをハイライト) */
+let placingCompIdx = -1
+/** Shift 範囲選択の起点 */
+let compAnchor = -1
 let compMenu: HTMLDivElement | null = null
 function closeCompMenu(): void { compMenu?.remove(); compMenu = null }
 
@@ -1370,7 +1399,8 @@ function editComponentInStudio(i: number): void {
       name: c.name,
       label: (first as { label: string }).label,
       symbol: (first as { symbol: 'rect' | 'round' }).symbol,
-      parts
+      parts,
+      symbolSketch: (first as { symbolSketch?: { edges: import('./model').SketchEdge[] } }).symbolSketch
     } : undefined)
   })
 }
@@ -1461,8 +1491,23 @@ function renderComponents(): void {
     dots.title = 'メニュー'
     dots.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><circle cx="12" cy="5" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="12" cy="19" r="1.8"/></svg>'
     dots.onclick = ev => { ev.stopPropagation(); openCompMenu(dots, i) }
+    d.classList.toggle('active', i === placingCompIdx && tm.tool === 'component')
     d.append(cb, name, dots)
-    d.onclick = () => { tm.placeComponent(c); setMsg(`「${c.name}」をクリックで配置`) }
+    d.onclick = ev => {
+      if (ev.shiftKey && compAnchor >= 0) {
+        // Shift+クリック: 起点から今回までのチェックをまとめて ON
+        const [a, b] = [Math.min(compAnchor, i), Math.max(compAnchor, i)]
+        for (let k = a; k <= b; k++) compChecked.add(k)
+        renderComponents()
+        return
+      }
+      compAnchor = i
+      compChecked.add(i) // 選択したらチェックも入れる
+      placingCompIdx = i
+      tm.placeComponent(c)
+      renderComponents()
+      setMsg(`「${c.name}」をクリックで配置`)
+    }
     el.appendChild(d)
   })
 }
@@ -1530,6 +1575,12 @@ const commands: Record<string, () => void | Promise<void>> = {
     download(`${store.doc.meta.title || 'model'}.obj`, v.exportOBJ(), 'text/plain')
     setMsg('OBJ を書き出しました(SketchUp / Blender 等で開けます)')
   },
+  'export-dae': async () => {
+    const v = await ensure3D()
+    v.rebuild(store)
+    download(`${store.doc.meta.title || 'model'}.dae`, v.exportDAE(), 'model/vnd.collada+xml')
+    setMsg('DAE (COLLADA) を書き出しました。SketchUp の「インポート」でそのまま読み込めます(SKP は非公開仕様のため直接生成できません)')
+  },
   'export-gltf': async () => {
     const v = await ensure3D()
     v.rebuild(store)
@@ -1590,6 +1641,11 @@ async function ensure3D(): Promise<View3D> {
     view3d.getPlaceRot = () => tm.placeRot
     view3d.onPlanCursor = p => tm.setCursorHint(p)
     view3d.getNumBuf = () => tm.numBuffer
+    view3d.onExtrudeEnd = (id, faceIdx) => {
+      store.commit()
+      tm.finalizeFaceExtrude(id, faceIdx)
+      view3d?.highlightSelection()
+    }
     view3d.getPreviewEntity = p => {
       const t = tm.tool
       switch (t) {
@@ -1849,6 +1905,7 @@ lenBox.addEventListener('keydown', e => {
 })
 // キャンバスで直接タイプした数値もボックスに同期表示
 tm.onNumBuf = s => { if (document.activeElement !== lenBox) lenBox.value = s }
+tm.onNumApplied = p => { if (!$('#view3d').hidden) view3d?.showCursorAt(p) }
 ;($('#st-snap') as HTMLSelectElement).onchange = e => { tm.snapStep = parseFloat((e.target as HTMLSelectElement).value) || 0 }
 ;($('#st-grid') as HTMLInputElement).onchange = e => {
   renderer.showGrid = (e.target as HTMLInputElement).checked
@@ -1977,6 +2034,11 @@ document.querySelectorAll('#view3d-toolbar [data-view]').forEach(b => {
 ;($('#chk3d-wire') as HTMLInputElement).onchange = async e => {
   const v = await ensure3D()
   v.setWireframe((e.target as HTMLInputElement).checked)
+}
+;($('#chk3d-dims') as HTMLInputElement).onchange = async e => {
+  const v = await ensure3D()
+  v.showDims = (e.target as HTMLInputElement).checked
+  v.rebuild(store)
 }
 const sectionRange = $('#rng3d-section') as HTMLInputElement
 ;($('#chk3d-section') as HTMLInputElement).onchange = async e => {

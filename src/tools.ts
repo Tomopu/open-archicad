@@ -7,6 +7,7 @@ import { Renderer2D, elevAxis, ElevWallProj } from './renderer2d'
 import {
   Pt, pt, sub, add, dist, distToSeg, projT, lerp, snapTo, pointInPoly, norm, perp, polyArea, rotate,
   arcThrough, angleDetentDeg, lineIntersect, polyCentroid, sketchFaces, faceKey, faceInfo, strokePerpGuide,
+  prismMesh, distToPoly,
   CURSOR_PENCIL, CURSOR_HAND
 } from './geometry'
 import {
@@ -33,7 +34,7 @@ export const params = {
   equipment: { kind: 'boiler' as EquipKind },
   planting: { kind: 'tree' as PlantKind, height: 3000 },
   room: { use: '居室' as RoomUse, mode: 'rect' as DrawMode },
-  pencil: { mode: 'poly' as DrawMode, color: undefined as string | undefined },
+  pencil: { mode: 'poly' as DrawMode, color: undefined as string | undefined, style: 'solid' as import('./model').LineStyle },
   label: { size: 300 }
 }
 
@@ -383,17 +384,9 @@ export class ToolManager {
         if (dd < bd) { bd = dd; bestExt = { p: foot, from: t < 0 ? s.a : s.b, d: dW } }
       }
       if (bestExt) {
-        // 延長線に沿ってグリッド角点へ吸着(軸平行なら座標を、斜めは距離を丸める)
+        // 延長ガイドは必ずグリッドの交点で止まる(斜めの延長でも X/Y とも吸着)
         let foot = bestExt.p
-        if (this.snapStep > 0) {
-          if (Math.abs(bestExt.d.x) > 0.999) foot = pt(snapTo(foot.x, this.snapStep), foot.y)
-          else if (Math.abs(bestExt.d.y) > 0.999) foot = pt(foot.x, snapTo(foot.y, this.snapStep))
-          else {
-            const along = (foot.x - bestExt.from.x) * bestExt.d.x + (foot.y - bestExt.from.y) * bestExt.d.y
-            const sn = snapTo(along, this.snapStep)
-            foot = pt(bestExt.from.x + bestExt.d.x * sn, bestExt.from.y + bestExt.d.y * sn)
-          }
-        }
+        if (this.snapStep > 0) foot = pt(snapTo(foot.x, this.snapStep), snapTo(foot.y, this.snapStep))
         this.snapKind = '延長'
         this.snapGuides = [{ a: bestExt.from, b: foot }]
         return { ...foot }
@@ -411,13 +404,16 @@ export class ToolManager {
         }
       }
     }
-    // 鉛筆: 始点から 1 辺目と垂直方向の延長ガイド(3 辺目で長方形を閉じやすく)
+    // 鉛筆: 始点から 1 辺目と垂直方向の延長ガイド(3 辺目で長方形を閉じやすく)。
+    // 延長ガイドと同様、必ずグリッドの交点で止まる
     if (this.tool === 'pencil' && params.pencil.mode === 'poly' && this.penPts.length >= 2) {
       const g = strokePerpGuide(this.penPts, p, tol * 1.5)
       if (g) {
+        let foot = g.p
+        if (this.snapStep > 0) foot = pt(snapTo(foot.x, this.snapStep), snapTo(foot.y, this.snapStep))
         this.snapKind = '垂直'
-        this.snapGuides.push(g.guide)
-        return g.p
+        this.snapGuides.push({ a: g.guide.a, b: foot })
+        return foot
       }
     }
     this.snapKind = this.snapStep > 0 ? 'グリッド' : null
@@ -446,7 +442,20 @@ export class ToolManager {
         const wl = walls.get(e.wallId); if (!wl) continue
         const c = lerp(wl.a, wl.b, e.t)
         if (dist(p, c) < e.width / 2 + tol) return e
-      } else if (e.type === 'furniture' || e.type === 'equipment' || e.type === 'planting' || e.type === 'stair' || e.type === 'label' || e.type === 'column' || e.type === 'custom') {
+      } else if (e.type === 'furniture' || e.type === 'column' || e.type === 'custom' || e.type === 'equipment') {
+        // 回転を考慮したローカル座標での判定(バウンディングボックスより実形状にフィット)
+        const dims = e.type === 'equipment' ? equipSize(e) : { w: e.w, d: e.d }
+        const l = rotate(sub(p, e.pos), -e.rot)
+        if (e.type === 'column' && e.shape === 'round') {
+          if (dist(p, e.pos) <= e.w / 2 + tol) return e
+        } else if (Math.abs(l.x) <= dims.w / 2 + tol && Math.abs(l.y) <= dims.d / 2 + tol) {
+          return e
+        }
+      } else if (e.type === 'stair') {
+        // 階段は実際のフットプリント(多角形)で判定
+        const cs = this.cornersOf(e)
+        if (cs && pointInPoly(p, cs)) return e
+      } else if (e.type === 'planting' || e.type === 'label') {
         const b = this.r.entityBounds(e, walls)
         if (b && p.x >= b.min.x - tol && p.x <= b.max.x + tol && p.y >= b.min.y - tol && p.y <= b.max.y + tol) return e
       } else if (e.type === 'dimension') {
@@ -549,13 +558,54 @@ export class ToolManager {
     this.setSketchSub(null)
     this.store.emit()
   }
-  /** 選択中の面の押し出し高さを設定(プロパティ・3D の円錐つまみから) */
+  /** 選択中の面の押し出し高さを設定(プロパティ・3D の円錐つまみのドラッグ中) */
   setFaceHeight(id: string, poly: Pt[], h: number): void {
     const e = this.store.byId(id)
     if (e?.type !== 'sketch') return
     e.faces ??= {}
     const info = faceInfo(e, poly)
     e.faces[faceKey(poly)] = { ...info, h: h > 0 ? h : undefined, dead: false }
+  }
+  /**
+   * 押し出しの確定: 高さの付いた面を n 角柱の立体オブジェクト(CustomE)へ変換する。
+   * 辺 4 本なら箱、3 本なら三角柱、n 本なら n 角柱。
+   * その面の専有辺はスケッチから取り除き、空になればスケッチ自体を削除。
+   */
+  finalizeFaceExtrude(id: string, faceIdx: number): void {
+    const e = this.store.byId(id)
+    if (e?.type !== 'sketch') return
+    const faces = sketchFaces(e)
+    const poly = faces[faceIdx]
+    if (!poly) return
+    const h = faceInfo(e, poly).h ?? 0
+    if (h <= 0) return
+    const { positions, c, w, d } = prismMesh(poly, h)
+    const prism: Entity = {
+      id: uid(), type: 'custom', pos: c, rot: 0,
+      w, d, h, w0: w, d0: d, h0: h,
+      label: '', symbol: 'rect',
+      symbolPoly: poly.map(q => pt(q.x - c.x, q.y - c.y)),
+      positions,
+      elev: (e.z ?? 0) || undefined
+    }
+    // 面情報を消し、この面だけが使っている辺を取り除く
+    if (e.faces) delete e.faces[faceKey(poly)]
+    const onFace = (q: Pt): boolean => distToPoly(q, poly) < 3
+    const onOther = (q: Pt): boolean => faces.some((f, i) => i !== faceIdx && distToPoly(q, f) < 3)
+    e.edges = e.edges.filter(ed => {
+      const mid = lerp(ed.a, ed.b, 0.5)
+      const exclusive = onFace(ed.a) && onFace(ed.b) && onFace(mid) &&
+        !(onOther(ed.a) && onOther(ed.b) && onOther(mid))
+      return !exclusive
+    })
+    this.store.doc.entities.push(prism)
+    if (!e.edges.length) this.store.remove(new Set([e.id]))
+    this.setSketchSub(null)
+    // 変換後の立体を選択状態に
+    this.r.selection.clear()
+    this.r.selection.add(prism.id)
+    this.store.emit()
+    this.onSelectionChange()
   }
 
   // ---------- ポインタイベント ----------
@@ -996,27 +1046,37 @@ export class ToolManager {
       this.commitRect(this.rectStart, end)
       this.rectStart = null
     } else if (this.tool === 'pencil' && this.penPts.length) {
-      // 鉛筆の線: 長さ指定(現在のカーソル方向へ)
+      // 鉛筆の線: 長さ指定(現在のカーソル方向へ)。確定後はカーソルをその端点へ
       const last = this.penPts[this.penPts.length - 1]
       const dir = norm(sub(c, last))
       if (dir.x || dir.y) {
         const next = add(last, pt(dir.x * nums[0], dir.y * nums[0]))
         this.addSketchEdge(last, next)
         this.penPts.push(next)
+        this.cursor = { ...next }
+        this.onNumApplied(next)
       }
     } else if (this.tool === 'room' && this.roomPts.length) {
       const last = this.roomPts[this.roomPts.length - 1]
       const dir = norm(sub(c, last))
-      if (dir.x || dir.y) this.roomPts.push(add(last, pt(dir.x * nums[0], dir.y * nums[0])))
+      if (dir.x || dir.y) {
+        const next = add(last, pt(dir.x * nums[0], dir.y * nums[0]))
+        this.roomPts.push(next)
+        this.cursor = { ...next }
+        this.onNumApplied(next)
+      }
     }
     this.r.requestDraw()
   }
+  /** 数値入力で点を確定したとき(3D 側でカーソル表示をその端点へ移す) */
+  onNumApplied: (p: Pt) => void = () => {}
 
   /** ツール・Space の状態に合わせたカーソル(Space = 手 / 鉛筆 = 鉛筆アイコン) */
   private updateCursor(): void {
-    this.canvas.style.cursor = this.spaceDown ? CURSOR_HAND
+    const want = this.spaceDown ? CURSOR_HAND
       : this.tool === 'pencil' ? CURSOR_PENCIL
       : this.dupAwaitBase ? 'crosshair' : ''
+    if (this.canvas.style.cursor !== want) this.canvas.style.cursor = want
   }
 
   key(e: KeyboardEvent): void {
@@ -1612,7 +1672,7 @@ export class ToolManager {
     } else {
       this.store.commit()
       const target = this.sketchAt(a) ?? this.sketchAt(b)
-      const edges = poly.map((q, i) => ({ a: q, b: poly[(i + 1) % 4], color: params.pencil.color }))
+      const edges = poly.map((q, i) => ({ a: q, b: poly[(i + 1) % 4], color: params.pencil.color, style: params.pencil.style === 'solid' ? undefined : params.pencil.style }))
       if (target) { target.edges.push(...edges); this.store.emit() }
       else this.store.add({ id: uid(), type: 'sketch', edges })
     }
@@ -1636,7 +1696,7 @@ export class ToolManager {
       this.store.doc.entities.push(target)
       this.penTarget = target.id
     }
-    target.edges.push({ a: { ...a }, b: { ...b }, color: params.pencil.color })
+    target.edges.push({ a: { ...a }, b: { ...b }, color: params.pencil.color, style: params.pencil.style === 'solid' ? undefined : params.pencil.style })
     // 終点が別のスケッチに触れたらマージ(またいで閉路が作れる)
     for (const e of [...this.store.doc.entities]) {
       if (e.type !== 'sketch' || e === target || e.hidden) continue

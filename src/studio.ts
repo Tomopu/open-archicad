@@ -7,15 +7,20 @@ import { Evaluator, Brush, ADDITION, SUBTRACTION, INTERSECTION } from 'three-bvh
 import { CustomE, uid } from './model'
 import { Pt, pt, dist, norm, angleDetentDeg, snapTo, strokePerpGuide, CURSOR_PENCIL, CURSOR_HAND } from './geometry'
 import { SketchOverlay, axisLock, SnapInfo } from './sketchInput'
+import {
+  Prism, FaceRef, sameFace, faceFromHit, edgesOfFace, nearestEdge as nearestSolidEdge,
+  SolidHighlight, movePolyVertex
+} from './solidSelect'
 import { params } from './tools'
 
 type PartKind = 'box' | 'cyl' | 'sphere' | 'cone' | 'poly' | 'baked'
 export interface StudioPart {
   kind: PartKind
   op: 'add' | 'sub'
-  /** オブジェクト一覧での表示名(リネーム可能)と表示 / 非表示 */
+  /** オブジェクト一覧での表示名(リネーム可能)と表示 / 非表示・色 */
   name?: string
   hidden?: boolean
+  color?: string
   x: number; y: number; z: number      // 位置 mm(y は底面高さ)
   sx: number; sy: number; sz: number   // 寸法 mm
   rot: number                          // Y軸回転(度)
@@ -41,9 +46,9 @@ function partGeometry(p: StudioPart): THREE.BufferGeometry {
   let g: THREE.BufferGeometry
   switch (p.kind) {
     case 'box': g = new THREE.BoxGeometry(p.sx, p.sy, p.sz); break
-    case 'cyl': g = new THREE.CylinderGeometry(p.sx / 2, p.sx / 2, p.sy, 24); break
+    case 'cyl': g = new THREE.CylinderGeometry(p.sx / 2, p.sx / 2, p.sy, 24).scale(1, 1, p.sz / Math.max(1, p.sx)); break
     case 'sphere': g = new THREE.SphereGeometry(p.sx / 2, 20, 14).scale(1, p.sy / p.sx, p.sz / p.sx); break
-    case 'cone': g = new THREE.ConeGeometry(p.sx / 2, p.sy, 20); break
+    case 'cone': g = new THREE.ConeGeometry(p.sx / 2, p.sy, 20).scale(1, 1, p.sz / Math.max(1, p.sx)); break
     case 'poly': {
       // 鉛筆で描いた平面形状(plan y → +z)。高さ 0 = 厚さのない平面、> 0 で押し出し
       const pts = p.pts ?? []
@@ -130,6 +135,8 @@ export interface StudioInitial {
   label?: string
   symbol?: 'rect' | 'round'
   parts?: unknown
+  /** 自作の 2D 記号(再編集時に引き継ぐ) */
+  symbolSketch?: { edges: import('./model').SketchEdge[] }
 }
 
 export function openStudio(onSave: (ent: CustomE, name: string) => void, initial?: StudioInitial): void {
@@ -144,9 +151,6 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
       <div class="field" style="width:170px"><label style="width:auto">名前</label><input class="st-name"></div>
       <div class="field"><label style="width:auto">2D記号</label><select class="st-symbol"><option value="rect">矩形</option><option value="round">円</option></select></div>
       <div class="field" style="width:130px"><label style="width:auto">ラベル</label><input class="st-label"></div>
-      <label class="hint" style="display:flex;align-items:center;gap:3px" title="XYZ軸を表示">
-        <input type="checkbox" class="st-axes"> 軸
-      </label>
       <span style="flex:1"></span>
       <button data-a="preview">CSGプレビュー</button>
       <button data-a="save" style="color:var(--accent);border:1px solid #bfdbfe">保存して閉じる</button>
@@ -159,8 +163,28 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
         ${railBtn('sphere', '球', KIND_ICON.sphere)}
         ${railBtn('cone', '円錐', KIND_ICON.cone)}
         ${railBtn('pen', '鉛筆', KIND_ICON.poly)}
+        <div class="st-toolopts props"></div>
       </div>
       <div class="studio-view">
+        <div class="studio-toolbar">
+          <button class="st-symmode" title="2D 記号を平面図モードで作図(3D 部品を半透明の下敷きに表示)">2D記号</button>
+          <span class="sep"></span>
+          <span class="hint">視点:</span>
+          <button data-v="top" title="上面">上</button>
+          <button data-v="front" title="正面">正</button>
+          <button data-v="side" title="側面">横</button>
+          <button data-v="iso" title="鳥瞰">鳥</button>
+          <span class="sep"></span>
+          <label class="hint" style="display:flex;align-items:center;gap:3px" title="XYZ軸を表示">
+            <input type="checkbox" class="st-axes"> 軸
+          </label>
+          <label class="hint" style="display:flex;align-items:center;gap:3px" title="ワイヤーフレーム表示">
+            <input type="checkbox" class="st-wire"> 線画
+          </label>
+          <label class="hint" style="display:flex;align-items:center;gap:3px" title="2D 記号(平面図での見え方)を高さ 0 に半透明で表示">
+            <input type="checkbox" class="st-sym2d"> 2D記号を表示
+          </label>
+        </div>
         <div class="studio-actions" hidden>
           <button data-pa="dup" title="複製"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
           <button data-pa="rot" title="回転リング(自由回転、45°ごとに吸着)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 11a8.5 8.5 0 1 0-2.2 7"/><path d="M21 4.5V11h-6.5"/></svg></button>
@@ -171,9 +195,15 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
         </div>
         <div class="studio-scale"><div class="segs"></div><div class="label"></div></div>
         <div class="studio-hint">クリック: 選択 / Shift+クリック: 追加選択 / ドラッグ: 移動 / 紫球: 高さ / 赤=くり抜き / 鉛筆: 地面をクリックして多角形(ダブルクリックで閉じる、2点なら長方形)</div>
+        <div class="studio-foot">
+          <label>長さ <input type="number" class="st-len" min="1" step="10" style="width:70px"> mm</label>
+          <span class="hint">数値 + Enter で鉛筆の辺の長さを確定 / ⌘Z: 取り消し</span>
+        </div>
       </div>
       <div class="studio-side">
-        <div class="panel-title">オブジェクト一覧</div>
+        <div class="panel-title">オブジェクト一覧
+          <span class="title-actions"><button class="st-merge" title="選択したオブジェクトをマージ(合成)" hidden>マージ</button></span>
+        </div>
         <div class="studio-parts"></div>
         <div class="panel-title">選択中のパーツ</div>
         <div class="studio-fields props"></div>
@@ -206,7 +236,7 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
   // XYZ 軸(トグル)
   const axes = new THREE.Group()
   {
-    const L = 100, R = 0.012
+    const L = 100, R = 0.006
     const defs: [number, [number, number, number]][] = [
       [0xdc2626, [0, 0, -Math.PI / 2]], [0x16a34a, [0, 0, 0]], [0x2563eb, [Math.PI / 2, 0, 0]]
     ]
@@ -240,6 +270,135 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
   let previewing = false
   let rotMode = false
   const primary = (): number => (selSet.size ? Math.max(...selSet) : -1)
+  // Undo / Redo(3D モードと同じ ⌘Z / ⇧⌘Z)
+  const undoStack: string[] = []
+  const redoStack: string[] = []
+  const pushUndo = (): void => {
+    undoStack.push(JSON.stringify(parts))
+    if (undoStack.length > 60) undoStack.shift()
+    redoStack.length = 0
+  }
+  const restoreParts = (json: string): void => {
+    parts.length = 0
+    parts.push(...(JSON.parse(json) as StudioPart[]))
+    selSet.clear()
+    if (parts.length) selSet.add(parts.length - 1)
+    refresh()
+  }
+  const studioUndo = (): void => {
+    const j = undoStack.pop()
+    if (j === undefined) return
+    redoStack.push(JSON.stringify(parts))
+    restoreParts(j)
+  }
+  const studioRedo = (): void => {
+    const j = redoStack.pop()
+    if (j === undefined) return
+    undoStack.push(JSON.stringify(parts))
+    restoreParts(j)
+  }
+
+  // ---------- 2D 記号モード(平面図で記号を作図。3D には反映されない) ----------
+  let symMode = false
+  let symEdges: import('./model').SketchEdge[] =
+    JSON.parse(JSON.stringify(initial?.symbolSketch?.edges ?? []))
+  let symStroke: Pt[] = []
+  const symDrawGroup = new THREE.Group()
+  scene.add(symDrawGroup)
+  const GHOST_PART_MAT = new THREE.MeshLambertMaterial({ color: 0xd4d4d8, transparent: true, opacity: 0.22, side: THREE.DoubleSide })
+  const drawSymEdges = (): void => {
+    symDrawGroup.traverse(o => { if (o instanceof THREE.Line) o.geometry.dispose() })
+    symDrawGroup.clear()
+    for (const ed of symEdges) {
+      const g = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(ed.a.x * MM, 0.004, ed.a.y * MM),
+        new THREE.Vector3(ed.b.x * MM, 0.004, ed.b.y * MM)])
+      const ln = new THREE.Line(g, new THREE.LineBasicMaterial({ color: ed.color ?? '#1f2937' }))
+      ln.renderOrder = 991
+      symDrawGroup.add(ln)
+    }
+  }
+  // 記号はモデル上「部品中心からの相対 mm」。スタジオでは絶対座標で扱うので変換する
+  const symCenter = (): Pt => {
+    const geo = csgOf(parts, 'recipe')
+    if (!geo) return pt(0, 0)
+    geo.computeBoundingBox()
+    const bb = geo.boundingBox!
+    return bb.isEmpty() ? pt(0, 0) : pt((bb.min.x + bb.max.x) / 2, (bb.min.z + bb.max.z) / 2)
+  }
+  if (symEdges.length) {
+    const c = symCenter()
+    symEdges = symEdges.map(ed => ({
+      ...ed,
+      a: pt(ed.a.x + c.x, ed.a.y + c.y),
+      b: pt(ed.b.x + c.x, ed.b.y + c.y)
+    }))
+  }
+  drawSymEdges()
+
+  // ---------- 立体(多角形パーツ)の面・辺選択 — solidSelect 共有モジュール ----------
+  const solidHL = new SolidHighlight()
+  scene.add(solidHL.group)
+  let solidSelS: { idx: number; mode: 'face' | 'edges' | 'edge'; face: FaceRef; edgeIdx?: number } | null = null
+  let solidHoverS: { idx: number; face: FaceRef } | null = null
+  let solidEdgeHoverS: number | null = null
+  let solidCycPend: { idx: number; face: FaceRef | null; edgeIdx: number } | null = null
+  const prismOfPart = (p: StudioPart | undefined): Prism | null => {
+    if (!p || p.kind !== 'poly' || !p.pts?.length) return null
+    const sxf = p.sx / (p.bx ?? p.sx), szf = p.sz / (p.bz ?? p.sz)
+    const rad = (p.rot * Math.PI) / 180
+    const cos = Math.cos(rad), sin = Math.sin(rad)
+    const poly = p.pts.map(q => {
+      const lx = q.x * sxf, lz = q.y * szf
+      return pt(p.x + lx * cos - lz * sin, p.z + lx * sin + lz * cos)
+    })
+    return { poly, y0: p.y * MM, y1: (p.y + Math.max(p.sy, 0)) * MM }
+  }
+  const updateSolidHLS = (): void => {
+    solidHL.clear()
+    if (solidSelS) {
+      const prism = prismOfPart(parts[solidSelS.idx])
+      if (prism) {
+        if (solidSelS.mode === 'face') solidHL.showFace(prism, solidSelS.face, 'sel')
+        else if (solidSelS.mode === 'edges') {
+          solidHL.showEdges(prism, solidSelS.face)
+          if (solidEdgeHoverS !== null) {
+            const e = edgesOfFace(prism, solidSelS.face)[solidEdgeHoverS]
+            if (e) solidHL.showEdge(e, 'hover')
+          }
+        } else if (solidSelS.edgeIdx !== undefined) {
+          const e = edgesOfFace(prism, solidSelS.face)[solidSelS.edgeIdx]
+          if (e) solidHL.showEdge(e, 'sel')
+        }
+      }
+    }
+    if (solidHoverS && (!solidSelS || (solidSelS.mode === 'face' &&
+      !(solidSelS.idx === solidHoverS.idx && sameFace(solidSelS.face, solidHoverS.face))))) {
+      const prism = prismOfPart(parts[solidHoverS.idx])
+      if (prism) solidHL.showFace(prism, solidHoverS.face, 'hover')
+    }
+  }
+  // テスト用の状態フック(UI には影響しない)
+  ;(window as unknown as { __stDbg?: unknown }).__stDbg = {
+    get sel() { return solidSelS }, get hover() { return solidHoverS },
+    get edgeHover() { return solidEdgeHoverS }, get selSet() { return [...selSet] },
+    get parts() { return parts }, get symMode() { return symMode }, get symEdges() { return symEdges },
+    proj(xMm: number, zMm: number, yM = 0): { x: number; y: number } {
+      const v = new THREE.Vector3(xMm * MM, yM, zMm * MM).project(camera)
+      const rc = renderer.domElement.getBoundingClientRect()
+      return { x: ((v.x + 1) / 2) * rc.width, y: ((1 - v.y) / 2) * rc.height }
+    }
+  }
+  const setPartPolyWorld = (p: StudioPart, worldPoly: Pt[]): void => {
+    const xs = worldPoly.map(q => q.x), ys = worldPoly.map(q => q.y)
+    const cx = Math.round((Math.min(...xs) + Math.max(...xs)) / 2)
+    const cy = Math.round((Math.min(...ys) + Math.max(...ys)) / 2)
+    const bw = Math.max(10, Math.round(Math.max(...xs) - Math.min(...xs)))
+    const bh = Math.max(10, Math.round(Math.max(...ys) - Math.min(...ys)))
+    p.x = cx; p.z = cy; p.rot = 0
+    p.sx = bw; p.sz = bh; p.bx = bw; p.bz = bh
+    p.pts = worldPoly.map(q => ({ x: Math.round(q.x - cx), y: Math.round(q.y - cy) }))
+  }
 
   // ---------- 鉛筆(多角形 / 長方形 → 押し出し)。3D モードと同じ入力機構(sketchInput)を共用 ----------
   let penMode = false
@@ -299,8 +458,10 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
       if (params.pencil.mode === 'poly' && penPts.length >= 2) {
         const g = strokePerpGuide(penPts, cur, 60)
         if (g) {
-          snap = { p: g.p, kind: '垂直', guides: [...snap.guides, g.guide] }
-          return { cur: g.p, snap, axis: null }
+          // グリッドの交点で止める(2D・3D と同じ挙動)
+          const foot = pt(snapTo(g.p.x, 10), snapTo(g.p.y, 10))
+          snap = { p: foot, kind: '垂直', guides: [...snap.guides, { a: g.guide.a, b: foot }] }
+          return { cur: foot, snap, axis: null }
         }
       }
       const al = axisLock(penRectStart ?? (penPts.length ? penPts[penPts.length - 1] : null), snap.p)
@@ -346,6 +507,18 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
     }
     const p = parts[primary()]
     if (!p) return
+    // 辺だけが選択されているとき: 端点つまみのみ(辺の長さ編集)
+    if (solidSelS && solidSelS.mode === 'edge' && solidSelS.idx === primary() && solidSelS.edgeIdx !== undefined) {
+      const prism = prismOfPart(p)
+      if (prism) {
+        const ed = edgesOfFace(prism, solidSelS.face)[solidSelS.edgeIdx]
+        if (ed?.vi) {
+          mkSquare('qe0', ed.a.x, ed.a.y + 0.01, ed.a.z, 0xf59e0b)
+          mkSquare('qe1', ed.b.x, ed.b.y + 0.01, ed.b.z, 0xf59e0b)
+          return
+        }
+      }
+    }
     const cx = p.x * MM, cz = p.z * MM
     const midY = (p.y + p.sy / 2) * MM
     if (rotMode) {
@@ -491,12 +664,160 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
     axes.visible = (e.target as HTMLInputElement).checked
     render()
   }
+  // 2D 記号のプレビュー(高さ 0・半透明。3D 側と干渉しない表示ガイド)
+  const symGroup = new THREE.Group()
+  symGroup.visible = false
+  scene.add(symGroup)
+  const updateSym2d = (): void => {
+    symGroup.traverse(o => { if (o instanceof THREE.Mesh) o.geometry.dispose() })
+    symGroup.clear()
+    if (!symGroup.visible) { render(); return }
+    const bb = new THREE.Box3().setFromObject(partsGroup)
+    if (bb.isEmpty()) { render(); return }
+    const w = Math.max(0.05, bb.max.x - bb.min.x)
+    const d = Math.max(0.05, bb.max.z - bb.min.z)
+    const cx = (bb.min.x + bb.max.x) / 2, cz = (bb.min.z + bb.max.z) / 2
+    const round = (modal.querySelector('.st-symbol') as HTMLSelectElement).value === 'round'
+    const geo = round
+      ? new THREE.CircleGeometry(Math.max(w, d) / 2, 40).scale(1, d / Math.max(w, d), 1)
+      : new THREE.PlaneGeometry(w, d)
+    geo.rotateX(-Math.PI / 2)
+    const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({
+      color: 0x2563eb, transparent: true, opacity: 0.18, side: THREE.DoubleSide, depthWrite: false
+    }))
+    mesh.position.set(cx, 0.002, cz)
+    symGroup.add(mesh)
+    render()
+  }
+  ;(modal.querySelector('.st-sym2d') as HTMLInputElement).onchange = e => {
+    symGroup.visible = (e.target as HTMLInputElement).checked
+    updateSym2d()
+  }
+  ;(modal.querySelector('.st-symbol') as HTMLSelectElement).addEventListener('change', () => updateSym2d())
 
+  // 線画(ワイヤーフレーム)
+  ;(modal.querySelector('.st-wire') as HTMLInputElement).onchange = e => {
+    const on = (e.target as HTMLInputElement).checked
+    const seen = new Set<THREE.Material>()
+    partsGroup.traverse(o => {
+      if (!(o instanceof THREE.Mesh)) return
+      const m = o.material as THREE.MeshLambertMaterial
+      if (!seen.has(m)) { seen.add(m); m.wireframe = on }
+    })
+    for (const m of [MAT_ADD, MAT_SUB, MAT_SEL, MAT_RESULT]) m.wireframe = on
+    render()
+  }
+  // 視点プリセット(3D モードと同様)
+  modal.querySelectorAll('[data-v]').forEach(b => {
+    ;(b as HTMLButtonElement).onclick = () => {
+      const bb = new THREE.Box3().setFromObject(partsGroup)
+      const c = bb.isEmpty() ? new THREE.Vector3(0, 0.2, 0) : bb.getCenter(new THREE.Vector3())
+      const size = bb.isEmpty() ? 2 : bb.getSize(new THREE.Vector3()).length()
+      const d = Math.max(1.2, size * 1.4)
+      const v = (b as HTMLElement).dataset.v
+      const pos: Record<string, number[]> = {
+        top: [c.x, c.y + d, c.z + 0.01],
+        front: [c.x, c.y + d * 0.15, c.z + d],
+        side: [c.x + d, c.y + d * 0.15, c.z],
+        iso: [c.x + d * 0.7, c.y + d * 0.6, c.z + d * 0.7]
+      }
+      const q = pos[v ?? 'iso']
+      camera.position.set(q[0], q[1], q[2])
+      controls.target.copy(c)
+      controls.update()
+      render()
+    }
+  })
+  // 2D 記号モード: 上面視点に切り替え、3D 部品を半透明の下敷きにして記号を作図
+  const symBtn = modal.querySelector('.st-symmode') as HTMLButtonElement
+  const setSymMode = (on: boolean): void => {
+    symMode = on
+    symBtn.classList.toggle('active', on)
+    symStroke = []
+    setPenMode(false)
+    endPlacing()
+    solidSelS = null; solidHoverS = null; updateSolidHLS()
+    if (on) {
+      // 上面(平面図)視点へ
+      const bb = new THREE.Box3().setFromObject(partsGroup)
+      const c = bb.isEmpty() ? new THREE.Vector3(0, 0, 0) : bb.getCenter(new THREE.Vector3())
+      const size = bb.isEmpty() ? 2 : bb.getSize(new THREE.Vector3()).length()
+      camera.position.set(c.x, Math.max(1.5, size * 1.6), c.z + 0.001)
+      controls.target.set(c.x, 0, c.z)
+      controls.update()
+    }
+    exitPreview()
+    rebuildParts()
+    sketchOv.hide()
+    renderer.domElement.style.cursor = on ? CURSOR_PENCIL : ''
+    render()
+  }
+  symBtn.onclick = () => setSymMode(!symMode)
+
+  // 一覧のマージボタン(複数選択時)
+  const mergeBtn = modal.querySelector('.st-merge') as HTMLButtonElement
+  mergeBtn.onclick = () => applyBool('union')
+  // 左レールのツール設定(鉛筆の入力モード・新規オブジェクトの色)
+  const tooloptsEl = modal.querySelector('.st-toolopts') as HTMLElement
+  const renderToolOpts = (): void => {
+    tooloptsEl.innerHTML = '<div class="cp-title">ツール設定</div>'
+    const modeSel = document.createElement('select')
+    modeSel.innerHTML = '<option value="poly">鉛筆(線)</option><option value="rect">長方形(2点)</option>'
+    modeSel.value = params.pencil.mode
+    modeSel.onchange = () => { params.pencil.mode = modeSel.value as 'poly' | 'rect' }
+    const modeDiv = document.createElement('div')
+    modeDiv.className = 'field'
+    modeDiv.innerHTML = '<label>入力モード</label>'
+    modeDiv.appendChild(modeSel)
+    const colorIn = document.createElement('input')
+    colorIn.type = 'color'
+    colorIn.value = params.pencil.color ?? '#d4d4d8'
+    colorIn.onchange = () => { params.pencil.color = colorIn.value }
+    const colorDiv = document.createElement('div')
+    colorDiv.className = 'field'
+    colorDiv.innerHTML = '<label>色(新規)</label>'
+    colorDiv.appendChild(colorIn)
+    tooloptsEl.append(modeDiv, colorDiv)
+  }
+  renderToolOpts()
+  // 画面下部の長さ入力(鉛筆の辺の長さを mm で確定)
+  const lenIn = modal.querySelector('.st-len') as HTMLInputElement
+  lenIn.addEventListener('keydown', e => {
+    e.stopPropagation()
+    if (e.key !== 'Enter') return
+    e.preventDefault()
+    const len = parseFloat(lenIn.value)
+    lenIn.value = ''
+    if (!(len > 0) || !penMode || !penPts.length) return
+    const last = penPts[penPts.length - 1]
+    const dir = penHover ? norm(pt(penHover.x - last.x, penHover.y - last.y)) : pt(1, 0)
+    if (dir.x || dir.y) {
+      const next = pt(Math.round(last.x + dir.x * len), Math.round(last.y + dir.y * len))
+      penPts.push(next)
+      penHover = next
+      sketchOv.update({
+        camera, canvas: renderer.domElement,
+        cursor: next, y: 0, pts: penPts, rectStart: penRectStart,
+        snap: { p: next, kind: null, guides: [] }, mode: params.pencil.mode, crossMm: 20
+      })
+      render()
+    }
+  })
+
+  const colorMats = new Map<string, THREE.MeshLambertMaterial>()
+  const partMat = (p: StudioPart): THREE.Material => {
+    if (p.op === 'sub') return MAT_SUB
+    if (!p.color) return MAT_ADD
+    let m = colorMats.get(p.color)
+    if (!m) { m = new THREE.MeshLambertMaterial({ color: p.color, side: THREE.DoubleSide }); colorMats.set(p.color, m) }
+    return m
+  }
   const rebuildParts = (): void => {
     partsGroup.traverse(o => { if (o instanceof THREE.Mesh) o.geometry.dispose() })
     partsGroup.clear()
     parts.forEach((p, i) => {
-      const mesh = new THREE.Mesh(partGeometry(p), selSet.has(i) ? MAT_SEL : p.op === 'add' ? MAT_ADD : MAT_SUB)
+      const mesh = new THREE.Mesh(partGeometry(p),
+        symMode ? GHOST_PART_MAT : selSet.has(i) ? MAT_SEL : partMat(p))
       mesh.userData.idx = i
       mesh.visible = !p.hidden
       partsGroup.add(mesh)
@@ -532,6 +853,7 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
     p.name ?? `${KIND_LABEL[p.kind]}${p.op === 'sub' ? '(くり抜き)' : ''}`
   const renderList = (): void => {
     if (listEl.contains(document.activeElement)) return // リネーム入力中は再構築しない
+    mergeBtn.hidden = selSet.size < 2
     listEl.innerHTML = ''
     parts.forEach((p, i) => {
       const row = document.createElement('div')
@@ -606,6 +928,7 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
       del.title = '削除'
       del.onclick = ev => {
         ev.stopPropagation()
+        pushUndo()
         parts.splice(i, 1)
         selSet.clear()
         if (parts.length) selSet.add(Math.min(i, parts.length - 1))
@@ -621,7 +944,7 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
     div.innerHTML = `<label>${label}</label>`
     const inp = document.createElement('input')
     inp.type = 'number'; inp.value = String(get())
-    inp.onchange = () => { set(parseFloat(inp.value) || 0); exitPreview(); rebuildParts(); renderList() }
+    inp.onchange = () => { pushUndo(); set(parseFloat(inp.value) || 0); exitPreview(); rebuildParts(); renderList() }
     div.appendChild(inp)
     return div
   }
@@ -638,8 +961,18 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
     opDiv.className = 'field'
     opDiv.innerHTML = '<label>操作</label>'
     opDiv.appendChild(opSel)
+    // 色(オブジェクトに色を塗る)
+    const colDiv = document.createElement('div')
+    colDiv.className = 'field'
+    colDiv.innerHTML = '<label>色</label>'
+    const colIn = document.createElement('input')
+    colIn.type = 'color'
+    colIn.value = p.color ?? '#d4d4d8'
+    colIn.onchange = () => { pushUndo(); p.color = colIn.value; exitPreview(); rebuildParts(); renderList() }
+    colDiv.appendChild(colIn)
     fieldsEl.append(
       opDiv,
+      colDiv,
       num('X mm', () => p.x, v => { p.x = v }),
       num('Y(底面) mm', () => p.y, v => { p.y = v }),
       num('Z mm', () => p.z, v => { p.z = v }),
@@ -659,7 +992,8 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
   let numBuf = ''
   let penHover: Pt | null = null
   const applyCursor = (): void => {
-    renderer.domElement.style.cursor = spaceOn ? CURSOR_HAND : penMode ? CURSOR_PENCIL : ''
+    const want = spaceOn ? CURSOR_HAND : penMode ? CURSOR_PENCIL : ''
+    if (renderer.domElement.style.cursor !== want) renderer.domElement.style.cursor = want
   }
   const onSpaceKey = (e: KeyboardEvent): void => {
     const tag = (e.target as HTMLElement).tagName
@@ -671,7 +1005,22 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
       return
     }
     if (e.type !== 'keydown') return
-    // ⌘Z: 鉛筆で引いている途中の線を 1 本戻す(即時反映)
+    // ⌘Z / ⇧⌘Z: パーツ操作の Undo / Redo(鉛筆の作図中は線を 1 本戻す)
+    if (symMode && (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
+      e.preventDefault()
+      if (symStroke.length > 1) { symStroke.pop(); symEdges.pop() }
+      else if (symStroke.length) symStroke = []
+      else symEdges.pop()
+      drawSymEdges()
+      render()
+      return
+    }
+    if (symMode && e.key === 'Escape') { symStroke = []; sketchOv.hide(); render(); return }
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z' && !penMode) {
+      e.preventDefault()
+      if (e.shiftKey) studioRedo(); else studioUndo()
+      return
+    }
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z' && penMode) {
       e.preventDefault()
       if (penPts.length) penPts.pop()
@@ -680,7 +1029,7 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
         sketchOv.update({
           camera, canvas: renderer.domElement,
           cursor: penHover, y: 0, pts: penPts, rectStart: penRectStart,
-          snap: { p: penHover, kind: null, guides: [] }, mode: params.pencil.mode, crossMm: 60
+          snap: { p: penHover, kind: null, guides: [] }, mode: params.pencil.mode, crossMm: 20
         })
       }
       render()
@@ -695,7 +1044,16 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
         numBuf = ''
         const last = penPts[penPts.length - 1]
         const dir = penHover ? norm(pt(penHover.x - last.x, penHover.y - last.y)) : pt(1, 0)
-        if (len > 0 && (dir.x || dir.y)) penPts.push(pt(Math.round(last.x + dir.x * len), Math.round(last.y + dir.y * len)))
+        if (len > 0 && (dir.x || dir.y)) {
+          const next = pt(Math.round(last.x + dir.x * len), Math.round(last.y + dir.y * len))
+          penPts.push(next)
+          penHover = next // カーソル表示をその端点へ
+          sketchOv.update({
+            camera, canvas: renderer.domElement,
+            cursor: next, y: 0, pts: penPts, rectStart: penRectStart,
+            snap: { p: next, kind: null, guides: [] }, mode: params.pencil.mode, crossMm: 20
+          })
+        }
         render()
       }
     }
@@ -735,6 +1093,7 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
   /** 多角形(mm)をパーツ化 */
   const makePolyPart = (poly: Pt[]): void => {
     if (poly.length < 3) return
+    pushUndo()
     const xs = poly.map(q => q.x), ys = poly.map(q => q.y)
     const cx = (Math.min(...xs) + Math.max(...xs)) / 2
     const cy = (Math.min(...ys) + Math.max(...ys)) / 2
@@ -761,13 +1120,32 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
     refresh()
   }
 
+  // レールのプリミティブ: クリック → 半透明ゴーストがカーソルに追従 → クリックで配置(3D モードと同様)
+  let placing: PartKind | null = null
+  const placeGhost = new THREE.Group()
+  placeGhost.scale.setScalar(MM)
+  placeGhost.visible = false
+  scene.add(placeGhost)
+  const PLACE_MAT = new THREE.MeshBasicMaterial({ color: 0x2563eb, transparent: true, opacity: 0.32, depthWrite: false })
+  const endPlacing = (): void => {
+    placing = null
+    placeGhost.visible = false
+    placeGhost.traverse(o => { if (o instanceof THREE.Mesh) o.geometry.dispose() })
+    placeGhost.clear()
+    modal.querySelectorAll('.studio-rail button').forEach(b => b.classList.remove('placing'))
+    render()
+  }
   modal.querySelectorAll('[data-add]').forEach(b => {
     ;(b as HTMLButtonElement).onclick = () => {
       const kind = (b as HTMLElement).dataset.add as PartKind | 'pen'
-      if (kind === 'pen') { setPenMode(!penMode); return } // 鉛筆はモード切替(地面をクリックして多角形)
-      parts.push({ kind, op: 'add', x: 0, y: 0, z: 0, sx: 400, sy: 400, sz: 400, rot: 0 })
-      selSet.clear(); selSet.add(parts.length - 1)
-      refresh()
+      if (kind === 'pen') { endPlacing(); setPenMode(!penMode); return } // 鉛筆はモード切替
+      setPenMode(false)
+      endPlacing()
+      placing = kind
+      b.classList.add('placing')
+      placeGhost.add(new THREE.Mesh(
+        partGeometry({ kind, op: 'add', x: 0, y: 0, z: 0, sx: 400, sy: 400, sz: 400, rot: 0 }), PLACE_MAT))
+      placeGhost.visible = false // 最初のマウス移動で表示
     }
   })
 
@@ -775,6 +1153,7 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
   const applyBool = (mode: 'union' | 'subtract' | 'intersect'): void => {
     const idxs = [...selSet].sort((a, b) => a - b)
     if (idxs.length < 2) return
+    pushUndo()
     const geo = csgOf(idxs.map(i => parts[i]), mode)
     if (!geo) return
     const baked = bakePart(geo, 'add')
@@ -813,6 +1192,7 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
     rebuildParts()
   }
   ;(actionsEl.querySelector('[data-pa="del"]') as HTMLButtonElement).onclick = () => {
+    pushUndo()
     for (const i of [...selSet].sort((a, b) => b - a)) parts.splice(i, 1)
     selSet.clear()
     if (parts.length) selSet.add(parts.length - 1)
@@ -845,6 +1225,38 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
   renderer.domElement.addEventListener('pointerdown', e => {
     if (e.button !== 0 || previewing) return
     if (spaceOn) return // Space 中は視点操作(OrbitControls に任せる)
+    // 2D 記号モード: 鉛筆と同じ操作で記号の線を描く
+    if (symMode) {
+      e.stopPropagation()
+      const pc = penCursor(e)
+      if (!pc) return
+      if (!symStroke.length) {
+        symStroke = [pc.cur]
+      } else {
+        const last = symStroke[symStroke.length - 1]
+        if (dist(pc.cur, last) > 1) {
+          symEdges.push({ a: { ...last }, b: { ...pc.cur }, color: params.pencil.color, style: params.pencil.style === 'solid' ? undefined : params.pencil.style })
+          if (symStroke.length >= 2 && dist(pc.cur, symStroke[0]) < 80) symStroke = []
+          else symStroke.push(pc.cur)
+          drawSymEdges()
+        }
+      }
+      render()
+      return
+    }
+    // プリミティブの配置モード: クリックで確定
+    if (placing) {
+      e.stopPropagation()
+      const gp = groundPt(e)
+      if (!gp) return
+      const sp = studioSnap(gp).p
+      pushUndo()
+      parts.push({ kind: placing, op: 'add', x: Math.round(sp.x), y: 0, z: Math.round(sp.y), sx: 400, sy: 400, sz: 400, rot: 0, color: params.pencil.color })
+      selSet.clear(); selSet.add(parts.length - 1)
+      endPlacing()
+      refresh()
+      return
+    }
     // 基準点複写: 1 クリック目 = 基準点 / 2 クリック目 = 配置先
     if (dupState) {
       e.stopPropagation()
@@ -865,6 +1277,7 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
         render()
         return
       }
+      pushUndo()
       const off = { x: sp.x - dupState.base.x, y: sp.y - dupState.base.y }
       const news: number[] = []
       for (const i of dupState.ids) {
@@ -913,6 +1326,7 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
         e.stopPropagation()
         controls.enabled = false
         renderer.domElement.style.cursor = 'grabbing'
+        pushUndo()
         if (kind.startsWith('r')) {
           const p = parts[primary()]
           const center = (gizmo.children[0] as THREE.Mesh).position.clone()
@@ -950,7 +1364,30 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
       rebuildParts(); renderList(); renderFields()
       return
     }
+    // 多角形パーツ: 面 → 辺 → 1 辺 → 全体 のサイクル(静止クリックで進む)
+    {
+      const part = parts[idx]
+      const prism = prismOfPart(part)
+      if (prism) {
+        const n = hits[0].face ? hits[0].face.normal.clone().transformDirection(hits[0].object.matrixWorld) : null
+        const f = faceFromHit(prism, hits[0].point, n)
+        if (selSet.has(idx) && selSet.size === 1) {
+          let edgeIdx = -1
+          if (solidSelS?.mode === 'edges' && solidSelS.idx === idx) {
+            edgeIdx = nearestSolidEdge(edgesOfFace(prism, solidSelS.face), camera, renderer.domElement, e.clientX, e.clientY)
+          }
+          solidCycPend = { idx, face: f, edgeIdx }
+        } else if (f) {
+          solidSelS = { idx, mode: 'face', face: f } // 1 回目のクリックで面
+          updateSolidHLS()
+        }
+      } else if (solidSelS) {
+        solidSelS = null
+        updateSolidHLS()
+      }
+    }
     if (!selSet.has(idx)) { selSet.clear(); selSet.add(idx) }
+    pushUndo()
     dragIds = [...selSet]
     dragLast = hits[0].point.clone()
     renderer.domElement.style.cursor = 'grabbing'
@@ -959,6 +1396,30 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
 
   renderer.domElement.addEventListener('pointermove', e => {
     if (spaceOn) return // 視点操作中はオーバーレイ更新もしない
+    // 2D 記号モード: 鉛筆と同じ十字カーソル + ライブ線
+    if (symMode) {
+      const pc = penCursor(e)
+      if (pc) {
+        sketchOv.update({
+          camera, canvas: renderer.domElement,
+          cursor: pc.cur, y: 0, pts: symStroke,
+          snap: pc.snap, axis: pc.axis, mode: 'poly', crossMm: 20
+        })
+        render()
+      }
+      return
+    }
+    // プリミティブ配置モード: ゴーストがカーソルに追従
+    if (placing) {
+      const gp = groundPt(e)
+      if (gp) {
+        const sp = studioSnap(gp).p
+        placeGhost.position.set(sp.x * MM, 0, sp.y * MM)
+        placeGhost.visible = true
+        render()
+      }
+      return
+    }
     // 基準点複写: 十字 + スナップガイド。基準点決定後はゴーストがカーソルに追従
     if (dupState) {
       const gp = groundPt(e)
@@ -966,7 +1427,7 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
         const snap = studioSnap(gp)
         sketchOv.update({
           camera, canvas: renderer.domElement,
-          cursor: snap.p, y: 0, snap, crossMm: 60
+          cursor: snap.p, y: 0, snap, crossMm: 20
         })
         if (dupState.base) {
           dupGhost.position.set((snap.p.x - dupState.base.x) * MM, 0, (snap.p.y - dupState.base.y) * MM)
@@ -984,7 +1445,7 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
           cursor: pc.cur, y: 0, pts: penPts, rectStart: penRectStart,
           snap: pc.snap, axis: pc.axis, mode: params.pencil.mode,
           dims: numBuf ? [{ text: `${numBuf} ⏎`, at: pc.cur }] : undefined,
-          crossMm: 60
+          crossMm: 20
         })
         render()
       }
@@ -1006,6 +1467,24 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
     if (handleDrag) {
       ray.setFromCamera(ndc(e), camera)
       const k = handleDrag.kind
+      if (k === 'qe0' || k === 'qe1') {
+        const p = parts[primary()]
+        const sel = solidSelS
+        if (!p || !sel || sel.mode !== 'edge' || sel.edgeIdx === undefined) return
+        const prism = prismOfPart(p)
+        if (!prism) return
+        const ed = edgesOfFace(prism, sel.face)[sel.edgeIdx]
+        if (!ed?.vi) return
+        const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -handleDrag.grabY)
+        const q = new THREE.Vector3()
+        if (!ray.ray.intersectPlane(plane, q)) return
+        const to = pt(Math.round(q.x / MM / 10) * 10, Math.round(q.z / MM / 10) * 10)
+        setPartPolyWorld(p, movePolyVertex(prism.poly, k === 'qe0' ? ed.vi[0] : ed.vi[1], to))
+        dragMoved = true
+        exitPreview(); rebuildParts(); renderFields()
+        updateSolidHLS(); updateGizmo()
+        return
+      }
       if (k === 'scaleAll') {
         // 複数選択の一括拡大縮小(相対位置・比率を保持)
         const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -handleDrag.grabY)
@@ -1124,6 +1603,42 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
       exitPreview(); rebuildParts(); renderFields()
       return
     }
+    // 立体(多角形パーツ)の面 / 辺ホバー
+    if (!previewing && !penMode && !symMode) {
+      ray.setFromCamera(ndc(e), camera)
+      let hov: { idx: number; face: FaceRef } | null = null
+      let eh: number | null = null
+      const hits = ray.intersectObjects(partsGroup.children, false)
+      if (hits.length) {
+        const idx = hits[0].object.userData.idx as number
+        const prism = prismOfPart(parts[idx])
+        if (prism) {
+          if (solidSelS?.mode === 'edges' && solidSelS.idx === idx) {
+            const i = nearestSolidEdge(edgesOfFace(prism, solidSelS.face), camera, renderer.domElement, e.clientX, e.clientY)
+            eh = i >= 0 ? i : null
+          } else {
+            const n = hits[0].face ? hits[0].face.normal.clone().transformDirection(hits[0].object.matrixWorld) : null
+            const f = faceFromHit(prism, hits[0].point, n)
+            if (f) hov = { idx, face: f }
+          }
+        }
+      } else if (solidSelS?.mode === 'edges') {
+        const prism = prismOfPart(parts[solidSelS.idx])
+        if (prism) {
+          const i = nearestSolidEdge(edgesOfFace(prism, solidSelS.face), camera, renderer.domElement, e.clientX, e.clientY)
+          eh = i >= 0 ? i : null
+        }
+      }
+      const same = eh === solidEdgeHoverS &&
+        ((hov === null) === (solidHoverS === null)) &&
+        (!hov || !solidHoverS || (hov.idx === solidHoverS.idx && sameFace(hov.face, solidHoverS.face)))
+      if (!same) {
+        solidHoverS = hov
+        solidEdgeHoverS = eh
+        updateSolidHLS()
+        render()
+      }
+    }
     // つまみホバーで grab カーソル + リングのホバー強調
     if (!previewing && gizmo.children.length) {
       ray.setFromCamera(ndc(e), camera)
@@ -1142,6 +1657,28 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
   })
   const endInteraction = (e: PointerEvent): void => {
     const wasInteracting = !!(dragIds || handleDrag || ringDrag)
+    // 立体の面 / 辺サイクル(動かしていないときだけ進める)
+    if (solidCycPend && !dragMoved) {
+      const sc = solidCycPend
+      const cur = solidSelS
+      if (!cur || cur.idx !== sc.idx) {
+        if (sc.face) solidSelS = { idx: sc.idx, mode: 'face', face: sc.face }
+      } else if (cur.mode === 'face') {
+        solidSelS = sc.face && sameFace(cur.face, sc.face)
+          ? { idx: cur.idx, mode: 'edges', face: cur.face }
+          : sc.face ? { idx: cur.idx, mode: 'face', face: sc.face } : cur
+      } else if (cur.mode === 'edges') {
+        if (sc.edgeIdx >= 0) solidSelS = { idx: cur.idx, mode: 'edge', face: cur.face, edgeIdx: sc.edgeIdx }
+        else solidSelS = null // 全体選択
+      } else {
+        solidSelS = null
+      }
+      solidEdgeHoverS = null
+      updateSolidHLS()
+      updateGizmo()
+      render()
+    }
+    solidCycPend = null
     dragIds = null
     dragLast = null
     handleDrag = null
@@ -1154,9 +1691,11 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
       const hitPart = ray.intersectObjects(partsGroup.children, false).length > 0
       const hitGizmo = gizmo.children.length > 0 && ray.intersectObjects(gizmo.children, true).length > 0
       const cameraMoved = dragMoved
-      if (!hitPart && !hitGizmo && !cameraMoved && selSet.size) {
+      if (!hitPart && !hitGizmo && !cameraMoved && (selSet.size || solidSelS)) {
         selSet.clear()
         rotMode = false
+        solidSelS = null; solidHoverS = null; solidEdgeHoverS = null
+        updateSolidHLS()
         rebuildParts(); renderList(); renderFields()
       }
     }
@@ -1166,7 +1705,9 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
   renderer.domElement.addEventListener('dblclick', () => { if (penMode && penPts.length >= 2) closePen() })
   renderer.domElement.addEventListener('contextmenu', e => {
     e.preventDefault()
+    if (symMode) { symStroke = []; sketchOv.hide(); render(); return } // 右クリックで線を終了
     if (penMode) setPenMode(false) // 右クリックで鉛筆をキャンセル
+    if (placing) endPlacing() // 右クリックで配置をキャンセル
     if (dupState) { renderer.domElement.style.cursor = ''; endDup() } // 右クリックで複写をキャンセル
   })
   // キャンバス外で離した場合も確実に終了(紫つまみが付いてくる問題の防止)
@@ -1203,6 +1744,11 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
       symbol: (modal.querySelector('.st-symbol') as HTMLSelectElement).value as 'rect' | 'round',
       positions: baked.positions ?? [],
       recipe: { parts: JSON.parse(JSON.stringify(parts)) }
+    }
+    if (symEdges.length) {
+      // 保存時に部品中心からの相対座標へ(2D 図面で部品位置に追従させるため)
+      const rel = (q: Pt): Pt => pt(Math.round(q.x - baked.x), Math.round(q.y - baked.z))
+      ent.symbolSketch = { edges: symEdges.map(ed => ({ ...ed, a: rel(ed.a), b: rel(ed.b) })) }
     }
     onSave(ent, name)
     close()

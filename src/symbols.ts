@@ -278,13 +278,46 @@ export function drawFurniture(ctx: CanvasRenderingContext2D, f: Furniture, zoom:
 export function drawCustom(ctx: CanvasRenderingContext2D, e: import('./model').CustomE, zoom: number): void {
   ctx.save()
   ctx.translate(e.pos.x, e.pos.y); ctx.rotate(e.rot)
+  // 自作の 2D 記号(取り込んだスケッチ)。3D 側とは独立
+  if (e.symbolSketch) {
+    if (e.show3d) {
+      // 3D 部品のフットプリントを半透明で重ねる(表示ガイド。互いに干渉しない)
+      ctx.save()
+      ctx.globalAlpha = 0.22
+      ctx.fillStyle = e.color ?? '#94a3b8'
+      ctx.beginPath()
+      if (e.symbolPoly?.length) {
+        e.symbolPoly.forEach((q, i) => (i === 0 ? ctx.moveTo(q.x, q.y) : ctx.lineTo(q.x, q.y)))
+        ctx.closePath()
+      } else ctx.rect(-e.w / 2, -e.d / 2, e.w, e.d)
+      ctx.fill()
+      ctx.restore()
+    }
+    const DASH2: Record<string, number[]> = { solid: [], dash: [180, 110], dot: [16, 90], dashdot: [240, 90, 16, 90] }
+    for (const ed of e.symbolSketch.edges) {
+      ctx.strokeStyle = ed.color ?? INK
+      lw(ctx, zoom, 1.1)
+      ctx.setLineDash(DASH2[ed.style ?? 'solid'])
+      line(ctx, ed.a.x, ed.a.y, ed.b.x, ed.b.y)
+    }
+    ctx.setLineDash([])
+    for (const t of e.symbolSketch.texts ?? []) text(ctx, t.text, t.pos.x, t.pos.y, t.size)
+    ctx.restore()
+    if (e.label) text(ctx, e.label, e.pos.x, e.pos.y - e.d / 2 - 180, Math.min(240, Math.max(140, e.d * 0.25)), 0, THIN)
+    return
+  }
   ctx.strokeStyle = INK; ctx.fillStyle = e.color ?? '#ffffff'; lw(ctx, zoom, 1)
   ctx.beginPath()
-  if (e.symbol === 'round') ctx.ellipse(0, 0, e.w / 2, e.d / 2, 0, 0, Math.PI * 2)
+  if (e.symbolPoly?.length) {
+    // n 角柱(スケッチから変換)は実フットプリントを描く
+    const sx = e.w / (e.w0 || e.w), sy = e.d / (e.d0 || e.d)
+    e.symbolPoly.forEach((q, i) => (i === 0 ? ctx.moveTo(q.x * sx, q.y * sy) : ctx.lineTo(q.x * sx, q.y * sy)))
+    ctx.closePath()
+  } else if (e.symbol === 'round') ctx.ellipse(0, 0, e.w / 2, e.d / 2, 0, 0, Math.PI * 2)
   else ctx.rect(-e.w / 2, -e.d / 2, e.w, e.d)
   ctx.fill(); ctx.stroke()
   ctx.restore()
-  if (e.label) text(ctx, e.label, e.pos.x, e.pos.y, Math.min(240, e.d * 0.3))
+  if (e.label) text(ctx, e.label, e.pos.x, e.pos.y, Math.min(240, Math.max(140, e.d * 0.3)))
 }
 
 // ---------------- 設備(電気・給排水は JIS C 0303 系の慣用記号) ----------------
@@ -481,13 +514,18 @@ export function drawSketch(
     ctx.fillStyle = 'rgba(37, 99, 235, 0.22)'
     fillPoly(ctx, faces[sub.faceIdx])
   }
-  // 辺
+  // 辺(線種: 実線・破線・点線・一点鎖線)
+  const DASH: Record<string, number[]> = {
+    solid: [], dash: [180, 110], dot: [16, 90], dashdot: [240, 90, 16, 90]
+  }
   for (let i = 0; i < s.edges.length; i++) {
     const e = s.edges[i]
     ctx.strokeStyle = e.color ?? INK
     lw(ctx, zoom, 1.2)
+    ctx.setLineDash(DASH[e.style ?? 'solid'])
     line(ctx, e.a.x, e.a.y, e.b.x, e.b.y)
   }
+  ctx.setLineDash([])
   // ホバー中の辺(閉路選択中): 明るい青で強調 → クリックでその辺だけを選択
   if (hoverEdge !== null && hoverEdge !== undefined && s.edges[hoverEdge]) {
     const e = s.edges[hoverEdge]

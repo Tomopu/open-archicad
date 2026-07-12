@@ -7,10 +7,14 @@ import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js'
 import { Store, Wall, Opening, Entity, SketchE, isWindow, MATERIALS, TexKind, FURN_DEFAULTS, EQUIP_SIZE, equipSize } from './model'
 import {
   Pt, pt, sub, norm, dist, distToSeg, snapTo, angleDetentDeg,
-  sketchFaces, faceNesting, faceInfo, faceKey, polyCentroid,
+  sketchFaces, faceNesting, faceInfo, faceKey, polyCentroid, prismMesh,
   CURSOR_PENCIL, CURSOR_HAND
 } from './geometry'
 import { SketchOverlay, axisLock, SnapInfo } from './sketchInput'
+import {
+  Prism, FaceRef, sameFace, faceFromHit, edgesOfFace, nearestEdge as nearestSolidEdge,
+  SolidHighlight, movePolyVertex
+} from './solidSelect'
 
 const M = 1 / 1000 // mm → m
 
@@ -173,12 +177,19 @@ function mkOutlined(parent: THREE.Group, kind: string, x: number, y: number, z: 
   parent.add(g)
 }
 
-const lineMatCache = new Map<string, THREE.LineBasicMaterial>()
-/** スケッチの辺の色付きラインマテリアル(キャッシュ) */
-function sketchLineMat(c?: string): THREE.LineBasicMaterial {
-  const key = c ?? '#1f2937'
+const lineMatCache = new Map<string, THREE.LineBasicMaterial | THREE.LineDashedMaterial>()
+/** スケッチの辺の色 + 線種のラインマテリアル(キャッシュ) */
+function sketchLineMat(c?: string, style?: string): THREE.LineBasicMaterial | THREE.LineDashedMaterial {
+  const key = `${c ?? '#1f2937'}|${style ?? 'solid'}`
   let m = lineMatCache.get(key)
-  if (!m) { m = new THREE.LineBasicMaterial({ color: key }); lineMatCache.set(key, m) }
+  if (!m) {
+    const color = c ?? '#1f2937'
+    if (style === 'dash') m = new THREE.LineDashedMaterial({ color, dashSize: 0.18, gapSize: 0.11 })
+    else if (style === 'dot') m = new THREE.LineDashedMaterial({ color, dashSize: 0.02, gapSize: 0.09 })
+    else if (style === 'dashdot') m = new THREE.LineDashedMaterial({ color, dashSize: 0.24, gapSize: 0.09 })
+    else m = new THREE.LineBasicMaterial({ color })
+    lineMatCache.set(key, m)
+  }
   return m
 }
 
@@ -280,10 +291,16 @@ export class View3D {
   getGrid: () => number = () => 910
   /** 階境界の点線・ワイヤーフレーム・断面(輪切り) */
   private floorLines = new THREE.Group()
+  /** 選択中の立体のエッジ(辺)表示 */
+  private selEdges = new THREE.Group()
+  private selEdgeMat = new THREE.LineBasicMaterial({ color: 0x1d4ed8, transparent: true, opacity: 0.9 })
   private wireframeOn = false
   private sectionPlane = new THREE.Plane(new THREE.Vector3(0, -1, 0), 0)
   private sectionOn = false
   private sectionFrac = 0.5
+  /** 寸法線・文字ラベルを 3D にも表示 */
+  showDims = false
+  private dimsGroup = new THREE.Group()
   /** 上階を隠す(内観の確認用) */
   showUpper = true
   /** 下階を隠す */
@@ -332,6 +349,108 @@ export class View3D {
   onPlanCursor: (p: Pt) => void = () => {}
   /** 数値入力バッファ(青ラベルで表示) */
   getNumBuf: () => string = () => ''
+  /** スケッチ面の押し出しドラッグ終了(main 経由で n 角柱へ変換) */
+  onExtrudeEnd: (id: string, faceIdx: number) => void = () => {}
+
+  /** 選択エンティティのワールド三角形を 1 つのジオメトリに集める(CSG 用) */
+  private worldGeometryOf(id: string): THREE.BufferGeometry | null {
+    const positions: number[] = []
+    const v = new THREE.Vector3()
+    for (const g of this.model.children) {
+      for (const child of g.children) {
+        if (child.userData.entId !== id) continue
+        child.updateWorldMatrix(true, true)
+        child.traverse(o => {
+          if (!(o instanceof THREE.Mesh)) return
+          const geo = o.geometry.index ? o.geometry.toNonIndexed() : o.geometry
+          const pos = geo.getAttribute('position')
+          for (let i = 0; i < pos.count; i++) {
+            v.fromBufferAttribute(pos, i).applyMatrix4(o.matrixWorld)
+            positions.push(v.x, v.y, v.z)
+          }
+          if (geo !== o.geometry) geo.dispose()
+        })
+      }
+    }
+    if (!positions.length) return null
+    const out = new THREE.BufferGeometry()
+    out.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
+    // three-bvh-csg は uv 属性を前提にするためダミーを付与
+    out.setAttribute('uv', new THREE.Float32BufferAttribute(new Float32Array((positions.length / 3) * 2), 2))
+    out.computeVertexNormals()
+    return out
+  }
+
+  /**
+   * 3D モードのブール演算(マージ / くり抜き / 交差)。
+   * 選択中の複数オブジェクトを 1 つのオリジナル部品(CustomE)に置き換える。
+   */
+  async boolOp(mode: 'union' | 'subtract' | 'intersect'): Promise<boolean> {
+    if (!this.store) return false
+    const sel = this.getSelection()
+    // ドキュメント順(先に作った方がベース)
+    const ids = this.store.doc.entities.filter(e => sel.has(e.id)).map(e => e.id)
+    if (ids.length < 2) return false
+    const { Evaluator, Brush, ADDITION, SUBTRACTION, INTERSECTION } = await import('three-bvh-csg')
+    const ev = new Evaluator()
+    let acc: InstanceType<typeof Brush> | null = null
+    for (const id of ids) {
+      const geo = this.worldGeometryOf(id)
+      if (!geo) continue
+      const brush = new Brush(geo)
+      brush.updateMatrixWorld()
+      if (!acc) { acc = brush; continue }
+      const op = mode === 'union' ? ADDITION : mode === 'subtract' ? SUBTRACTION : INTERSECTION
+      acc = ev.evaluate(acc, brush, op)
+    }
+    if (!acc) return false
+    const geo = acc.geometry
+    geo.computeBoundingBox()
+    const bb = geo.boundingBox!
+    if (bb.isEmpty()) return false
+    // 底面中央原点の mm メッシュへ正規化して CustomE に
+    const cx = (bb.min.x + bb.max.x) / 2, cz = (bb.min.z + bb.max.z) / 2
+    const posAttr = geo.getAttribute('position')
+    const positions: number[] = []
+    for (let i = 0; i < posAttr.count; i++) {
+      positions.push(
+        Math.round((posAttr.getX(i) - cx) * 1000 * 10) / 10,
+        Math.round((posAttr.getY(i) - bb.min.y) * 1000 * 10) / 10,
+        Math.round((posAttr.getZ(i) - cz) * 1000 * 10) / 10)
+    }
+    const w = Math.max(10, Math.round((bb.max.x - bb.min.x) * 1000))
+    const d = Math.max(10, Math.round((bb.max.z - bb.min.z) * 1000))
+    const h = Math.max(10, Math.round((bb.max.y - bb.min.y) * 1000))
+    const floorY = this.levelYs[this.store.active] ?? 0
+    const elev = Math.max(0, Math.round((bb.min.y - floorY) * 1000))
+    this.store.commit()
+    const ent: Entity = {
+      id: `e${Date.now().toString(36)}csg`, type: 'custom', pos: pt(cx * 1000, cz * 1000), rot: 0,
+      w, d, h, w0: w, d0: d, h0: h,
+      label: '', symbol: 'rect', positions,
+      elev: elev || undefined
+    }
+    this.store.remove(new Set(ids))
+    this.store.doc.entities.push(ent)
+    this.onSelectSet([ent.id])
+    this.store.emit()
+    return true
+  }
+  /** 数値確定直後はカーソル表示を端点に固定(次のマウス移動まで) */
+  private previewHold = false
+  /** 数値入力の確定点にカーソル表示を移す(2D・スタジオと同じ挙動) */
+  showCursorAt(p: Pt): void {
+    if (!this.store) return
+    this.lastPlanPoint = p
+    this.previewHold = true
+    this.sketchOv.update({
+      camera: this.camera, canvas: this.renderer.domElement,
+      cursor: p, y: this.levelYs[this.store.active] ?? 0,
+      pts: this.getRoomPts(), rectStart: this.getRectStart(),
+      snap: { p, kind: null, guides: [] }, mode: this.getDrawMode(), crossMm: 40
+    })
+    this.render()
+  }
   /** 直近のポインタ位置(Undo 直後などにオーバーレイを即時再描画するため) */
   private lastMoveEv: { clientX: number; clientY: number } | null = null
   /** 共通の作図オーバーレイ(十字カーソル・ライブ線・ガイド・青寸法) */
@@ -373,11 +492,11 @@ export class View3D {
     this.ground.position.y = -0.06
     this.scene.add(this.ground)
     this.buildGrid(910)
-    this.scene.add(this.grid, this.floorLines)
+    this.scene.add(this.grid, this.floorLines, this.selEdges, this.dimsGroup, this.solidHL.group)
     this.scene.add(this.gizmo, this.measureGroup, this.preview)
     // XYZ 軸: 太い円柱で表現し、実質無限長(±250m)に見せる
     {
-      const L = 500, R = 0.025
+      const L = 500, R = 0.0125
       const axisDefs: [number, [number, number, number]][] = [
         [0xdc2626, [0, 0, -Math.PI / 2]], // X 赤
         [0x16a34a, [0, 0, 0]],            // Y 緑
@@ -522,6 +641,7 @@ export class View3D {
 
   // ---------------- 3D 直接編集 ----------------
   private ray(e: PointerEvent): THREE.Raycaster {
+    this.raycaster.params.Line.threshold = 0.02 // 辺(Line)の当たり判定は 2cm(既定 1m は広すぎる)
     const r = this.renderer.domElement.getBoundingClientRect()
     const ndc = new THREE.Vector2(
       ((e.clientX - r.left) / r.width) * 2 - 1,
@@ -549,6 +669,85 @@ export class View3D {
       }
     }
     return null
+  }
+
+  // ---------- 角柱(スケッチ由来の立体)の面・辺選択 — solidSelect 共有モジュール ----------
+  private solidHL = new SolidHighlight()
+  private solidSel: { id: string; mode: 'face' | 'edges' | 'edge'; face: FaceRef; edgeIdx?: number } | null = null
+  private solidHover: { id: string; face: FaceRef } | null = null
+  private solidEdgeHover: number | null = null
+  private solidCyclePend: { id: string; face: FaceRef | null; edgeIdx: number } | null = null
+  /** スケッチ由来の n 角柱なら Prism 参照を返す */
+  private prismOf(e: Entity | undefined): Prism | null {
+    if (!e || e.type !== 'custom' || !e.symbolPoly?.length || !this.store) return null
+    const sx = e.w / (e.w0 || e.w), sz = e.d / (e.d0 || e.d)
+    const cos = Math.cos(e.rot), sin = Math.sin(e.rot)
+    const poly = e.symbolPoly.map(q => {
+      const lx = q.x * sx, lz = q.y * sz
+      return pt(e.pos.x + lx * cos - lz * sin, e.pos.y + lx * sin + lz * cos)
+    })
+    const y0 = (this.levelYs[this.store.active] ?? 0) + (e.elev ?? 0) * M
+    return { poly, y0, y1: y0 + e.h * M }
+  }
+  /** 面・辺の選択状態と ホバーのハイライトを更新 */
+  private updateSolidHL(): void {
+    this.solidHL.clear()
+    if (!this.store) return
+    const s = this.solidSel
+    if (s) {
+      const prism = this.prismOf(this.store.byId(s.id))
+      if (prism) {
+        if (s.mode === 'face') this.solidHL.showFace(prism, s.face, 'sel')
+        else if (s.mode === 'edges') {
+          this.solidHL.showEdges(prism, s.face)
+          if (this.solidEdgeHover !== null) {
+            const e = edgesOfFace(prism, s.face)[this.solidEdgeHover]
+            if (e) this.solidHL.showEdge(e, 'hover')
+          }
+        } else if (s.edgeIdx !== undefined) {
+          const e = edgesOfFace(prism, s.face)[s.edgeIdx]
+          if (e) this.solidHL.showEdge(e, 'sel')
+        }
+      }
+    }
+    if (this.solidHover && (!s || (s.mode === 'face' &&
+      !(s.id === this.solidHover.id && sameFace(s.face, this.solidHover.face))))) {
+      const prism = this.prismOf(this.store.byId(this.solidHover.id))
+      if (prism) this.solidHL.showFace(prism, this.solidHover.face, 'hover')
+    }
+  }
+  /** 静止クリックでサイクルを進める: 面 → 面の辺 → (辺クリックで 1 辺) → 全体 */
+  private advanceSolidCycle(): void {
+    const sc = this.solidCyclePend
+    if (!sc || !sc.face) { this.solidCyclePend = null; return }
+    const s = this.solidSel
+    if (!s || s.id !== sc.id) {
+      this.solidSel = { id: sc.id, mode: 'face', face: sc.face }
+    } else if (s.mode === 'face') {
+      this.solidSel = sameFace(s.face, sc.face)
+        ? { id: s.id, mode: 'edges', face: s.face }
+        : { id: s.id, mode: 'face', face: sc.face }
+    } else if (s.mode === 'edges') {
+      if (sc.edgeIdx >= 0) this.solidSel = { id: s.id, mode: 'edge', face: s.face, edgeIdx: sc.edgeIdx }
+      else this.solidSel = null // 全体選択
+    } else {
+      this.solidSel = null
+    }
+    this.solidCyclePend = null
+    this.solidEdgeHover = null
+    this.updateSolidHL()
+    this.updateGizmo()
+    this.render()
+  }
+  /** 辺の端点ドラッグ: フットプリント頂点を動かして角柱を作り直す */
+  private regenPrism(ent: Entity, worldPoly: Pt[]): void {
+    if (ent.type !== 'custom') return
+    const { positions, c, w, d } = prismMesh(worldPoly, ent.h)
+    ent.pos = c
+    ent.w = w; ent.d = d; ent.w0 = w; ent.d0 = d
+    ent.rot = 0
+    ent.symbolPoly = worldPoly.map(q => pt(q.x - c.x, q.y - c.y))
+    ent.positions = positions
   }
 
   // ---------- 面の選択 → プッシュ / プル(その面だけを伸縮) ----------
@@ -696,6 +895,29 @@ export class View3D {
       })
       return
     }
+    // 角柱の辺を選択中: 端点つまみ(qe0 / qe1)で辺の長さ(頂点位置)を編集
+    if (e.type === 'custom' && this.solidSel?.id === e.id && this.solidSel.mode === 'edge' &&
+      this.solidSel.edgeIdx !== undefined) {
+      const prism = this.prismOf(e)
+      const edge = prism ? edgesOfFace(prism, this.solidSel.face)[this.solidSel.edgeIdx] : null
+      if (edge?.vi) {
+        const mkEnd = (kind: string, v: THREE.Vector3): void => {
+          const g = new THREE.Group()
+          const white = new THREE.Mesh(new THREE.BoxGeometry(0.10, 0.10, 0.10),
+            new THREE.MeshBasicMaterial({ color: 0xffffff, depthTest: false }))
+          const blue = new THREE.Mesh(new THREE.BoxGeometry(0.072, 0.072, 0.072),
+            new THREE.MeshBasicMaterial({ color: 0x2563eb, depthTest: false }))
+          white.renderOrder = 998; blue.renderOrder = 999
+          g.add(white, blue)
+          g.position.copy(v)
+          g.userData.gizmo = kind
+          this.gizmo.add(g)
+        }
+        mkEnd('qe0', edge.a)
+        mkEnd('qe1', edge.b)
+      }
+      return
+    }
     if (e.type !== 'furniture' && e.type !== 'column' && e.type !== 'custom') return
     const elev = (e.type !== 'column' ? (e.elev ?? 0) : 0) * M
     const cx = e.pos.x * M, cz = e.pos.y * M
@@ -755,6 +977,26 @@ export class View3D {
   /** 選択状態のハイライトを再構築なしで反映(軽量) */
   highlightSelection(): void {
     const sel = this.getSelection()
+    // 選択中の立体は面に加えて「辺」も表示(EdgesGeometry のライン)
+    this.selEdges.traverse(o => { if (o instanceof THREE.LineSegments) o.geometry.dispose() })
+    this.selEdges.clear()
+    for (const g of this.model.children) {
+      if (!g.visible) continue
+      for (const child of g.children) {
+        const id = child.userData.entId as string | undefined
+        if (!id || !sel.has(id)) continue
+        child.updateWorldMatrix(true, false)
+        child.traverse(o => {
+          if (!(o instanceof THREE.Mesh)) return
+          o.updateWorldMatrix(true, false)
+          const ls = new THREE.LineSegments(new THREE.EdgesGeometry(o.geometry, 25), this.selEdgeMat)
+          ls.matrixAutoUpdate = false
+          ls.matrix.copy(o.matrixWorld)
+          ls.renderOrder = 995
+          this.selEdges.add(ls)
+        })
+      }
+    }
     for (const g of this.model.children) {
       for (const child of g.children) {
         const id = child.userData.entId as string | undefined
@@ -811,6 +1053,31 @@ export class View3D {
     this.render()
   }
 
+  /** テキストスプライト(寸法値・ラベルの 3D 表示用) */
+  private textSprite(text: string, at: THREE.Vector3): THREE.Sprite {
+    const pad = 8
+    const cv = document.createElement('canvas')
+    const c = cv.getContext('2d')!
+    c.font = '28px -apple-system, "Hiragino Sans", sans-serif'
+    const w = Math.ceil(c.measureText(text).width) + pad * 2
+    cv.width = w
+    cv.height = 44
+    const c2 = cv.getContext('2d')!
+    c2.font = '28px -apple-system, "Hiragino Sans", sans-serif'
+    c2.fillStyle = 'rgba(255,255,255,0.85)'
+    c2.fillRect(0, 0, w, 44)
+    c2.fillStyle = '#1f2937'
+    c2.textAlign = 'center'
+    c2.textBaseline = 'middle'
+    c2.fillText(text, w / 2, 22)
+    const tex = new THREE.CanvasTexture(cv)
+    const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false }))
+    sp.renderOrder = 990
+    sp.scale.set((w / 44) * 0.22, 0.22, 1)
+    sp.position.copy(at)
+    return sp
+  }
+
   /** 現在のビューを PNG で書き出し */
   exportPNG(): Promise<Blob | null> {
     this.render()
@@ -846,9 +1113,11 @@ export class View3D {
   }
   /** ツール・Space に応じたカーソル(手 / 鉛筆 / 既定) */
   private applyToolCursor(): void {
-    this.renderer.domElement.style.cursor = this.spaceOn ? CURSOR_HAND
+    const want = this.spaceOn ? CURSOR_HAND
       : this.getTool() === 'pencil' ? CURSOR_PENCIL
       : this.getDupAwait() ? 'crosshair' : ''
+    // 同じ値の再代入はチラつきの原因になるため避ける
+    if (this.renderer.domElement.style.cursor !== want) this.renderer.domElement.style.cursor = want
   }
   /** 左ドラッグ = 視点移動(従来どおり)。範囲選択は Shift+ドラッグ */
   private syncControlButtons(): void {
@@ -955,6 +1224,15 @@ export class View3D {
     } else if (!already) {
       this.onSelect(hit.id, hit.level, 'replace')
       this.faceSel = null
+      // スケッチ由来の角柱: 1 回目のクリックで「面」を選択
+      const prism0 = this.prismOf(this.store.byId(hit.id))
+      if (prism0 && hit.normal) {
+        const f = faceFromHit(prism0, hit.point, hit.normal)
+        this.solidSel = f ? { id: hit.id, mode: 'face', face: f } : null
+      } else {
+        this.solidSel = null
+      }
+      this.updateSolidHL()
     }
     this.highlightSelection()
     const movable = this.store.byId(hit.id)
@@ -970,9 +1248,19 @@ export class View3D {
       this.startGizmoDrag(movable, this.faceSel.kind, hit.point, e.pointerId)
       return
     }
-    // 単体選択の box 系を再クリック: 動かさなければ面選択(up で確定)
-    if (already && selNow.size === 1 && hit.normal &&
+    // 角柱: 再クリック(静止)で 面 → 辺 → 1 辺 → 全体 のサイクル(up で確定)
+    const prismM = this.prismOf(movable)
+    if (already && selNow.size === 1 && prismM) {
+      const f = hit.normal ? faceFromHit(prismM, hit.point, hit.normal) : null
+      let edgeIdx = -1
+      if (this.solidSel?.mode === 'edges') {
+        edgeIdx = nearestSolidEdge(edgesOfFace(prismM, this.solidSel.face), this.camera,
+          this.renderer.domElement, e.clientX, e.clientY)
+      }
+      this.solidCyclePend = { id: hit.id, face: f, edgeIdx }
+    } else if (already && selNow.size === 1 && hit.normal && !prismM &&
       (movable.type === 'furniture' || movable.type === 'column' || movable.type === 'custom') && 'rot' in movable) {
+      // 通常の箱系は従来どおり面プッシュ / プル
       this.facePending = this.faceKindFromNormal(movable, hit.normal)
     }
     this.store.commit()
@@ -993,6 +1281,7 @@ export class View3D {
 
   private pointerMove(e: PointerEvent): void {
     this.lastMoveEv = { clientX: e.clientX, clientY: e.clientY }
+    this.previewHold = false
     // 計測モード: オレンジの十字カーソル + メジャーアイコン + ライブ距離
     if (this.measureOn && this.store) {
       const r = this.container.getBoundingClientRect()
@@ -1181,6 +1470,25 @@ export class View3D {
         this.rebuildSoon()
         return
       }
+      if (ent.type === 'custom' && this.gizmoDrag.kind.startsWith('qe') &&
+        this.solidSel?.id === ent.id && this.solidSel.edgeIdx !== undefined) {
+        const prism = this.prismOf(ent)
+        if (!prism) return
+        const edge = edgesOfFace(prism, this.solidSel.face)[this.solidSel.edgeIdx]
+        if (!edge?.vi) return
+        const end = this.gizmoDrag.kind === 'qe0' ? 0 : 1
+        const vi = edge.vi[end]
+        const y = end === 0 ? edge.a.y : edge.b.y
+        const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -y)
+        const p = new THREE.Vector3()
+        if (!this.ray(e).ray.intersectPlane(plane, p)) return
+        const target = pt(snapTo(p.x * 1000, 10), snapTo(p.z * 1000, 10))
+        this.regenPrism(ent, movePolyVertex(prism.poly, vi, target))
+        this.showHint(`${Math.round(dist(prism.poly[edge.vi[0]], prism.poly[edge.vi[1]]))} mm`, e.clientX, e.clientY)
+        this.updateSolidHL()
+        this.rebuildSoon()
+        return
+      }
       if (ent.type === 'wall') {
         const k = this.gizmoDrag.kind
         if (k === 'wa' || k === 'wb') {
@@ -1296,6 +1604,35 @@ export class View3D {
     }
     if (!this.dragging || !this.store) {
       if (!this.dragging && !this.heightDrag && !this.gizmoDrag && !this.openingDrag) {
+        // 角柱の面 / 辺のホバーハイライト
+        if (this.getTool() === 'select' && !this.spaceOn && this.store) {
+          let hover: { id: string; face: FaceRef } | null = null
+          let edgeHover: number | null = null
+          if (this.solidSel?.mode === 'edges') {
+            const prism = this.prismOf(this.store.byId(this.solidSel.id))
+            if (prism) {
+              const idx = nearestSolidEdge(edgesOfFace(prism, this.solidSel.face), this.camera,
+                this.renderer.domElement, e.clientX, e.clientY)
+              edgeHover = idx >= 0 ? idx : null
+            }
+          } else {
+            const hit = this.pick(e, true)
+            if (hit) {
+              const prism = this.prismOf(this.store.byId(hit.id))
+              if (prism) {
+                const f = faceFromHit(prism, hit.point, hit.normal)
+                if (f) hover = { id: hit.id, face: f }
+              }
+            }
+          }
+          const changed = JSON.stringify(hover) !== JSON.stringify(this.solidHover) || edgeHover !== this.solidEdgeHover
+          if (changed) {
+            this.solidHover = hover
+            this.solidEdgeHover = edgeHover
+            this.updateSolidHL()
+            this.render()
+          }
+        }
         this.updatePreview(e)
         // つまみの上では OS の「つかむ手」カーソル、それ以外はツール別カーソル
         if (!this.spaceOn && this.gizmo.children.length &&
@@ -1389,6 +1726,20 @@ export class View3D {
       this.onEdited()
       return
     }
+    // スケッチの面の押し出しドラッグ終了 → n 角柱の立体オブジェクトへ変換
+    if (this.gizmoDrag?.kind.startsWith('sf') && moved && this.store) {
+      const gd = this.gizmoDrag
+      const ent = this.store.byId(gd.id)
+      if (ent?.type === 'sketch') {
+        const faceIdx = parseInt(gd.kind.slice(2), 10)
+        this.gizmoDrag = null
+        this.hideHint()
+        this.renderer.domElement.style.cursor = ''
+        this.controls.enabled = true
+        this.onExtrudeEnd(gd.id, faceIdx)
+        return
+      }
+    }
     if (this.dragging || this.heightDrag || this.gizmoDrag || this.openingDrag) {
       const wasDrag = moved
       if (this.dragging && wasDrag) {
@@ -1400,6 +1751,10 @@ export class View3D {
         this.onSelect(this.drillPending, this.store.active, 'drill')
         this.highlightSelection()
       }
+      if (!wasDrag && this.solidCyclePend && this.store) {
+        this.advanceSolidCycle()
+      }
+      this.solidCyclePend = null
       if (!wasDrag && this.facePending && this.store) {
         // クリック(動かさない)→ 面を選択(次のドラッグでその面だけ伸縮)
         const sel = [...this.getSelection()]
@@ -1610,7 +1965,8 @@ export class View3D {
           camera: this.camera, canvas: this.renderer.domElement,
           cursor: cur, y: yBase, pts, rectStart, snap, axis,
           mode: tool === 'dimension' ? null : this.getDrawMode(),
-          dims: nb ? [{ text: `${nb} ⏎`, at: cur }] : undefined
+          dims: nb ? [{ text: `${nb} ⏎`, at: cur }] : undefined,
+          crossMm: 40
         })
       }
     } else if (tool === 'component' && this.getComponentDef()) {
@@ -1704,6 +2060,8 @@ export class View3D {
       }
     }
     this.target = this.model
+    // グリッドは編集中の階の床の高さに置く(作図カーソルとの視差ズレをなくす)
+    this.grid.position.y = this.levelYs[store.active] ?? 0
 
     // 階の境界に薄い点線を表示(1F と 2F の境目など)
     this.floorLines.traverse(o => {
@@ -1732,6 +2090,38 @@ export class View3D {
       }
     }
 
+    // 寸法線・文字ラベルの 3D 表示
+    this.dimsGroup.traverse(o => {
+      if (o instanceof THREE.Line) o.geometry.dispose()
+      if (o instanceof THREE.Sprite) (o.material as THREE.SpriteMaterial).map?.dispose()
+    })
+    this.dimsGroup.clear()
+    this.dimsGroup.visible = this.showDims
+    if (this.showDims) {
+      store.doc.levels.forEach((level, li) => {
+        const y = (this.levelYs[li] ?? 0) + 0.02
+        for (const e of level.entities) {
+          if (e.hidden) continue
+          if (e.type === 'dimension') {
+            const dv = norm(sub(e.b, e.a))
+            const nv = { x: -dv.y, y: dv.x }
+            const a2 = pt(e.a.x + nv.x * e.offset, e.a.y + nv.y * e.offset)
+            const b2 = pt(e.b.x + nv.x * e.offset, e.b.y + nv.y * e.offset)
+            const ln = new THREE.Line(
+              new THREE.BufferGeometry().setFromPoints([
+                new THREE.Vector3(a2.x * M, y, a2.y * M), new THREE.Vector3(b2.x * M, y, b2.y * M)]),
+              new THREE.LineBasicMaterial({ color: 0x1f2937 }))
+            this.dimsGroup.add(ln)
+            this.dimsGroup.add(this.textSprite(`${Math.round(dist(e.a, e.b))}`,
+              new THREE.Vector3((a2.x + b2.x) / 2 * M, y + 0.12, (a2.y + b2.y) / 2 * M)))
+          } else if (e.type === 'label') {
+            this.dimsGroup.add(this.textSprite(e.text,
+              new THREE.Vector3(e.pos.x * M, y + 0.25, e.pos.y * M)))
+          }
+        }
+      })
+    }
+
     // ワイヤーフレーム・上下階の表示設定を反映
     if (this.wireframeOn) this.applyWireframe()
     if (this.sectionOn) this.setSection(true)
@@ -1752,7 +2142,7 @@ export class View3D {
     }
     this.highlightSelection() // render も行う
     // 作図中のライブ線・十字を即時更新(Undo 直後などの反映遅れ防止)
-    if (this.lastMoveEv && !this.dragging && !this.gizmoDrag && !this.openingDrag) {
+    if (this.lastMoveEv && !this.previewHold && !this.dragging && !this.gizmoDrag && !this.openingDrag) {
       this.updatePreview(this.lastMoveEv as PointerEvent)
     }
   }
@@ -2104,14 +2494,18 @@ export class View3D {
       const mesh = new THREE.Mesh(geo, hM > 0.001 ? MAT.sketchSolid : MAT.sketchFace)
       g.add(mesh)
     }
-    // 辺(色付き)
+    // 辺(色・線種付き)
     for (const ed of e.edges) {
       const lg = new THREE.BufferGeometry().setFromPoints([
         new THREE.Vector3(ed.a.x * M, 0.008, ed.a.y * M),
         new THREE.Vector3(ed.b.x * M, 0.008, ed.b.y * M)
       ])
-      g.add(new THREE.Line(lg, sketchLineMat(ed.color)))
+      const ln = new THREE.Line(lg, sketchLineMat(ed.color, ed.style))
+      ln.computeLineDistances()
+      g.add(ln)
     }
+    // 厚さ 0 の平面スケッチの持ち上げ(床からの高さ)
+    g.position.y += (e.z ?? 0) * M
     this.target.add(g)
   }
 
@@ -2275,6 +2669,47 @@ export class View3D {
       offset += posAttr.count
     })
     return out.join('\n')
+  }
+
+  /** DAE (COLLADA) 書き出し — SketchUp が標準で読み込める形式 */
+  exportDAE(): string {
+    const geoms: string[] = []
+    const nodes: string[] = []
+    let gi = 0
+    const v = new THREE.Vector3()
+    this.model.updateMatrixWorld(true)
+    this.model.traverse(obj => {
+      if (!(obj instanceof THREE.Mesh)) return
+      const geo = obj.geometry.index ? obj.geometry.toNonIndexed() : obj.geometry
+      const pos = geo.getAttribute('position')
+      if (!pos) return
+      const arr: number[] = []
+      for (let i = 0; i < pos.count; i++) {
+        v.fromBufferAttribute(pos, i).applyMatrix4(obj.matrixWorld)
+        arr.push(
+          Math.round(v.x * 1000) / 1000,
+          Math.round(-v.z * 1000) / 1000, // COLLADA は Z-up(Y-up 指定もするが SketchUp 互換で変換)
+          Math.round(v.y * 1000) / 1000)
+      }
+      if (geo !== obj.geometry) geo.dispose()
+      const id = `g${gi++}`
+      const idx = [...Array(pos.count).keys()].join(' ')
+      geoms.push(`<geometry id="${id}"><mesh>` +
+        `<source id="${id}-p"><float_array id="${id}-pa" count="${arr.length}">${arr.join(' ')}</float_array>` +
+        `<technique_common><accessor source="#${id}-pa" count="${pos.count}" stride="3">` +
+        `<param name="X" type="float"/><param name="Y" type="float"/><param name="Z" type="float"/></accessor></technique_common></source>` +
+        `<vertices id="${id}-v"><input semantic="POSITION" source="#${id}-p"/></vertices>` +
+        `<triangles count="${pos.count / 3}"><input semantic="VERTEX" source="#${id}-v" offset="0"/><p>${idx}</p></triangles>` +
+        `</mesh></geometry>`)
+      nodes.push(`<node id="n${id}"><instance_geometry url="#${id}"/></node>`)
+    })
+    return `<?xml version="1.0" encoding="utf-8"?>
+<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema" version="1.4.1">
+<asset><contributor><authoring_tool>Open ArchiCAD</authoring_tool></contributor><unit name="meter" meter="1"/><up_axis>Z_UP</up_axis></asset>
+<library_geometries>${geoms.join('')}</library_geometries>
+<library_visual_scenes><visual_scene id="Scene">${nodes.join('')}</visual_scene></library_visual_scenes>
+<scene><instance_visual_scene url="#Scene"/></scene>
+</COLLADA>`
   }
 
   /** glTF (GLB) 書き出し(Blender 等) */
