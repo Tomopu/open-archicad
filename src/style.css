@@ -235,13 +235,17 @@ button.active { background: var(--accent-bg); color: var(--accent); border-color
 .studio-view canvas { display: block; }
 .studio-side { width: 264px; border-left: 1px solid var(--border); overflow-y: auto; }
 .studio-rail {
-  width: 64px; border-right: 1px solid var(--border); display: flex; flex-direction: column;
-  gap: 4px; padding: 8px 6px; align-items: stretch;
+  width: 150px; min-width: 84px; max-width: 340px; flex: none;
+  border-right: 1px solid var(--border); display: flex; flex-flow: row wrap;
+  gap: 4px; padding: 8px; align-content: flex-start; overflow-y: auto;
 }
+.studio-rail > button { flex: 0 0 calc(50% - 2px); }
 .studio-rail button {
   display: flex; flex-direction: column; align-items: center; gap: 2px;
   border: 1px solid var(--border); padding: 7px 2px; font-size: 10px; color: var(--text2);
 }
+.studio-split { width: 5px; flex: none; cursor: col-resize; }
+.studio-split:hover { background: var(--accent-bg); }
 .studio-rail button svg { width: 20px; height: 20px; }
 .studio-rail button:hover { color: var(--accent); border-color: #bfdbfe; }
 .studio-actions {
@@ -253,7 +257,7 @@ button.active { background: var(--accent-bg); color: var(--accent); border-color
 .studio-actions button { padding: 5px 8px; display: flex; align-items: center; }
 .studio-actions button svg { width: 15px; height: 15px; }
 .studio-scale {
-  position: absolute; bottom: 12px; right: 12px; z-index: 15;
+  position: absolute; bottom: 38px; right: 12px; z-index: 15;
   background: rgba(255,255,255,.92); border: 1px solid var(--border); border-radius: 6px;
   padding: 6px 10px; pointer-events: none;
 }
@@ -263,11 +267,6 @@ button.active { background: var(--accent-bg); color: var(--accent); border-color
 .studio-scale .segs span:nth-child(even) { background: #fff; }
 .studio-scale .label { margin-top: 3px; color: var(--text2); font-size: 10px; text-align: center; }
 
-.studio-hint {
-  position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%);
-  background: rgba(255,255,255,.92); border: 1px solid var(--border); border-radius: 8px;
-  padding: 4px 12px; color: var(--text2); pointer-events: none; white-space: nowrap; font-size: 11px;
-}
 .studio-head .field { display: flex; align-items: center; gap: 4px; }
 .studio-head .field input, .studio-head .field select {
   font: inherit; border: 1px solid var(--border); border-radius: 5px; padding: 3px 6px; min-width: 0; flex: 1;
@@ -393,14 +392,16 @@ button.active { background: var(--accent-bg); color: var(--accent); border-color
 #st-len-wrap[hidden] { display: none; }
 
 /* ---- 部品スタジオ: ツール設定・フッタ・配置モード ---- */
-.st-toolopts { margin-top: 10px; padding: 6px 4px; border-top: 1px solid var(--border); font-size: 11px; display: flex; flex-direction: column; gap: 6px; }
+.st-toolopts { width: 100%; margin-top: 10px; padding: 6px 4px; border-top: 1px solid var(--border); font-size: 11px; display: flex; flex-direction: column; gap: 6px; }
 .st-toolopts .cp-title { font-weight: 600; color: var(--text2); }
 .st-toolopts .field { display: flex; flex-direction: column; gap: 2px; }
 .st-toolopts select, .st-toolopts input { width: 100%; }
 .studio-foot {
-  position: absolute; left: 12px; bottom: 10px; z-index: 21;
-  display: flex; align-items: center; gap: 10px; font-size: 11px; color: var(--text2);
-  background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 5px 10px;
-  box-shadow: 0 2px 8px rgba(0,0,0,.08);
+  position: absolute; left: 0; right: 0; bottom: 0; z-index: 21;
+  display: flex; align-items: center; gap: 12px; font-size: 11px; color: var(--text2);
+  background: var(--bg); border-top: 1px solid var(--border); padding: 4px 12px;
 }
+.studio-foot .spacer { flex: 1; }
+.studio-foot .sep { width: 1px; height: 14px; background: var(--border); }
+.studio-foot .st-coords { min-width: 110px; }
 .studio-rail button.placing { color: var(--accent); border-color: var(--accent); background: var(--accent-bg); }

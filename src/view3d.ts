@@ -13,7 +13,7 @@ import {
 import { SketchOverlay, axisLock, SnapInfo } from './sketchInput'
 import {
   Prism, FaceRef, sameFace, faceFromHit, edgesOfFace, nearestEdge as nearestSolidEdge,
-  SolidHighlight, movePolyVertex
+  SolidHighlight, movePolyVertex, sideNormal, extrudeSidePoly
 } from './solidSelect'
 
 const M = 1 / 1000 // mm → m
@@ -276,6 +276,10 @@ export class View3D {
     startW?: number; startD?: number; startH?: number; startDist?: number
     /** スケッチ頂点つまみ: 差分移動用の始点(初回 move で確定) */
     startVert?: Pt; startGround?: Pt
+    /** 面の垂直押し出し(fx): ドラッグ開始時のフットプリントと面 */
+    fx?: { poly: Pt[]; faceI: number; n: Pt; ground0: Pt }
+    /** 底面つまみ(hb): 開始時の elev / h */
+    hb?: { elev: number; h: number }
   } | null = null
   private gizmo = new THREE.Group()
   /** 回転モード(⟳ アイコンでトグル): XYZ の回転リングを表示 */
@@ -496,7 +500,7 @@ export class View3D {
     this.scene.add(this.gizmo, this.measureGroup, this.preview)
     // XYZ 軸: 太い円柱で表現し、実質無限長(±250m)に見せる
     {
-      const L = 500, R = 0.0125
+      const L = 500, R = 0.008
       const axisDefs: [number, [number, number, number]][] = [
         [0xdc2626, [0, 0, -Math.PI / 2]], // X 赤
         [0x16a34a, [0, 0, 0]],            // Y 緑
@@ -736,8 +740,7 @@ export class View3D {
     this.solidCyclePend = null
     this.solidEdgeHover = null
     this.updateSolidHL()
-    this.updateGizmo()
-    this.render()
+    this.highlightSelection() // 全体色の切替 + updateGizmo + render
   }
   /** 辺の端点ドラッグ: フットプリント頂点を動かして角柱を作り直す */
   private regenPrism(ent: Entity, worldPoly: Pt[]): void {
@@ -918,6 +921,46 @@ export class View3D {
       }
       return
     }
+    if (e.type === 'custom' && this.solidSel?.id === e.id &&
+      (this.solidSel.mode === 'face' || this.solidSel.mode === 'edges')) {
+      if (this.solidSel.mode === 'edges') return // 辺の選択待ち: つまみは出さない
+      const prism = this.prismOf(e)
+      if (prism) {
+        const mkCone = (kind: string, pos: THREE.Vector3, dir: THREE.Vector3): void => {
+          const g = new THREE.Group()
+          const white = new THREE.Mesh(new THREE.ConeGeometry(0.10, 0.21, 12),
+            new THREE.MeshBasicMaterial({ color: 0xffffff, depthTest: false }))
+          const blue = new THREE.Mesh(new THREE.ConeGeometry(0.072, 0.16, 12),
+            new THREE.MeshBasicMaterial({ color: 0x2563eb, depthTest: false }))
+          white.renderOrder = 998; blue.renderOrder = 999
+          g.add(white, blue)
+          g.position.copy(pos)
+          g.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir)
+          g.userData.gizmo = kind
+          this.gizmo.add(g)
+        }
+        const off = 0.16
+        const f = this.solidSel.face
+        if (f.kind === 'side') {
+          // 面に垂直な円錐: 引くとその面だけが平行移動し、隙間は新しい面で埋まる
+          const i = f.i
+          const a = prism.poly[i], b = prism.poly[(i + 1) % prism.poly.length]
+          const n2 = sideNormal(prism.poly, i)
+          const mid = pt((a.x + b.x) / 2, (a.y + b.y) / 2)
+          mkCone('fx',
+            new THREE.Vector3(mid.x * M + n2.x * off, (prism.y0 + prism.y1) / 2, mid.y * M + n2.y * off),
+            new THREE.Vector3(n2.x, 0, n2.y))
+        } else {
+          const c = polyCentroid(prism.poly)
+          if (f.kind === 'top') {
+            mkCone('h', new THREE.Vector3(c.x * M, prism.y1 + off, c.y * M), new THREE.Vector3(0, 1, 0))
+          } else {
+            mkCone('hb', new THREE.Vector3(c.x * M, prism.y0 - off, c.y * M), new THREE.Vector3(0, -1, 0))
+          }
+        }
+      }
+      return
+    }
     if (e.type !== 'furniture' && e.type !== 'column' && e.type !== 'custom') return
     const elev = (e.type !== 'column' ? (e.elev ?? 0) : 0) * M
     const cx = e.pos.x * M, cz = e.pos.y * M
@@ -977,6 +1020,11 @@ export class View3D {
   /** 選択状態のハイライトを再構築なしで反映(軽量) */
   highlightSelection(): void {
     const sel = this.getSelection()
+    // 選択から外れたら面・辺のサブ選択も解除
+    if (this.solidSel && !sel.has(this.solidSel.id)) {
+      this.solidSel = null
+      this.updateSolidHL()
+    }
     // 選択中の立体は面に加えて「辺」も表示(EdgesGeometry のライン)
     this.selEdges.traverse(o => { if (o instanceof THREE.LineSegments) o.geometry.dispose() })
     this.selEdges.clear()
@@ -985,6 +1033,7 @@ export class View3D {
       for (const child of g.children) {
         const id = child.userData.entId as string | undefined
         if (!id || !sel.has(id)) continue
+        if (this.solidSel?.id === id) continue // 面・辺の選択中は面ハイライトだけにする
         child.updateWorldMatrix(true, false)
         child.traverse(o => {
           if (!(o instanceof THREE.Mesh)) return
@@ -1001,7 +1050,7 @@ export class View3D {
       for (const child of g.children) {
         const id = child.userData.entId as string | undefined
         if (!id) continue
-        const on = sel.has(id)
+        const on = sel.has(id) && this.solidSel?.id !== id
         child.traverse(o => {
           if (o instanceof THREE.Mesh) {
             if (!o.userData.baseMat) o.userData.baseMat = o.material
@@ -1485,6 +1534,51 @@ export class View3D {
         const target = pt(snapTo(p.x * 1000, 10), snapTo(p.z * 1000, 10))
         this.regenPrism(ent, movePolyVertex(prism.poly, vi, target))
         this.showHint(`${Math.round(dist(prism.poly[edge.vi[0]], prism.poly[edge.vi[1]]))} mm`, e.clientX, e.clientY)
+        this.updateSolidHL()
+        this.rebuildSoon()
+        return
+      }
+      if (ent.type === 'custom' && this.gizmoDrag.kind === 'fx' &&
+        this.solidSel?.id === ent.id && this.solidSel.face.kind === 'side') {
+        const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -this.gizmoDrag.grabY)
+        const p = new THREE.Vector3()
+        if (!this.ray(e).ray.intersectPlane(plane, p)) return
+        const ground = pt(p.x * 1000, p.z * 1000)
+        if (!this.gizmoDrag.fx) {
+          const prism = this.prismOf(ent)
+          if (!prism) return
+          this.gizmoDrag.fx = {
+            poly: prism.poly.map(q => ({ ...q })),
+            faceI: this.solidSel.face.i,
+            n: sideNormal(prism.poly, this.solidSel.face.i),
+            ground0: ground
+          }
+          return
+        }
+        const fx = this.gizmoDrag.fx
+        const d = snapTo((ground.x - fx.ground0.x) * fx.n.x + (ground.y - fx.ground0.y) * fx.n.y, 10)
+        const res = extrudeSidePoly(fx.poly, fx.faceI, d)
+        this.regenPrism(ent, res.poly)
+        this.solidSel = { ...this.solidSel, face: { kind: 'side', i: res.newFaceI } }
+        this.showHint(`${Math.round(d)} mm`, e.clientX, e.clientY)
+        this.updateSolidHL()
+        this.rebuildSoon()
+        return
+      }
+      if (ent.type === 'custom' && this.gizmoDrag.kind === 'hb') {
+        // 底面つまみ: 上面は動かさず底面だけを上下(下向きが正)
+        const dir = this.camera.getWorldDirection(new THREE.Vector3())
+        const nv = new THREE.Vector3(dir.x, 0, dir.z).normalize()
+        const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(
+          nv, new THREE.Vector3(ent.pos.x * M, this.gizmoDrag.grabY, ent.pos.y * M))
+        const p = new THREE.Vector3()
+        if (!this.ray(e).ray.intersectPlane(plane, p)) return
+        if (!this.gizmoDrag.hb) this.gizmoDrag.hb = { elev: ent.elev ?? 0, h: ent.h }
+        const dd = snapTo((this.gizmoDrag.grabY - p.y) * 1000, 10)
+        const h = Math.max(10, this.gizmoDrag.hb.h + dd)
+        ent.h = h
+        ent.elev = (this.gizmoDrag.hb.elev - (h - this.gizmoDrag.hb.h)) || undefined
+        this.showHint(`高さ ${ent.h}`, e.clientX, e.clientY)
         this.updateSolidHL()
         this.rebuildSoon()
         return
@@ -2062,6 +2156,8 @@ export class View3D {
     this.target = this.model
     // グリッドは編集中の階の床の高さに置く(作図カーソルとの視差ズレをなくす)
     this.grid.position.y = this.levelYs[store.active] ?? 0
+    // 軸も床の高さ(z=0)に合わせる
+    this.axes.position.y = this.levelYs[store.active] ?? 0
 
     // 階の境界に薄い点線を表示(1F と 2F の境目など)
     this.floorLines.traverse(o => {
@@ -2140,6 +2236,10 @@ export class View3D {
         this.didFitCamera = true
       }
     }
+    // 面・辺ハイライトを最新の形状に追従させる(移動・リサイズでズレたまま残らないように)
+    if (this.solidSel && !this.prismOf(this.store?.byId(this.solidSel.id))) this.solidSel = null
+    if (this.solidHover && !this.prismOf(this.store?.byId(this.solidHover.id))) this.solidHover = null
+    this.updateSolidHL()
     this.highlightSelection() // render も行う
     // 作図中のライブ線・十字を即時更新(Undo 直後などの反映遅れ防止)
     if (this.lastMoveEv && !this.previewHold && !this.dragging && !this.gizmoDrag && !this.openingDrag) {

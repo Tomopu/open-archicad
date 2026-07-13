@@ -156,3 +156,35 @@ export function movePolyVertex(poly: Pt[], vi: number, to: Pt): Pt[] {
   const cur = poly[vi]
   return poly.map((q, i) => (i === vi || dist(q, cur) < 3 ? { ...to } : q))
 }
+
+/** 側面 i の外向き法線(平面 XY、単位ベクトル) */
+export function sideNormal(poly: Pt[], i: number): Pt {
+  const a = poly[i], b = poly[(i + 1) % poly.length]
+  const len = Math.max(1e-6, dist(a, b))
+  let n = pt((b.y - a.y) / len, -(b.x - a.x) / len)
+  // 重心から遠ざかる向きを外向きとする
+  const cx = poly.reduce((s, q) => s + q.x, 0) / poly.length
+  const cy = poly.reduce((s, q) => s + q.y, 0) / poly.length
+  const mid = pt((a.x + b.x) / 2, (a.y + b.y) / 2)
+  if (n.x * (mid.x - cx) + n.y * (mid.y - cy) < 0) n = pt(-n.x, -n.y)
+  return n
+}
+
+/**
+ * 側面 i を法線方向へ d(mm)押し出した poly を返す。
+ * 他の面は動かさず、辺の両端に新しい頂点を挿入して隙間を面で埋める
+ * (三角柱の側面を伸ばすと五角柱になる)。newFaceI は移動後の面の index。
+ */
+export function extrudeSidePoly(poly: Pt[], i: number, d: number): { poly: Pt[]; newFaceI: number } {
+  if (Math.abs(d) < 1) return { poly: poly.map(q => ({ ...q })), newFaceI: i }
+  const n = sideNormal(poly, i)
+  const a = poly[i], b = poly[(i + 1) % poly.length]
+  const a2 = pt(Math.round(a.x + n.x * d), Math.round(a.y + n.y * d))
+  const b2 = pt(Math.round(b.x + n.x * d), Math.round(b.y + n.y * d))
+  const out: Pt[] = []
+  for (let k = 0; k < poly.length; k++) {
+    out.push({ ...poly[k] })
+    if (k === i) { out.push(a2, b2) }
+  }
+  return { poly: out, newFaceI: i + 1 }
+}
