@@ -69,9 +69,9 @@ const MAT = {
   dark: new THREE.MeshLambertMaterial({ color: 0x374151 }),
   water: new THREE.MeshLambertMaterial({ color: 0x93c5fd, transparent: true, opacity: 0.6 }),
   selected: new THREE.MeshLambertMaterial({ color: 0x93b4f8, emissive: 0x1d4ed8, emissiveIntensity: 0.18 }),
-  // スケッチ(鉛筆)の面: 平面 = 薄い青 / 押し出した立体 = 明るいグレージュ(両面描画で裏からも見える)
+  // スケッチ(鉛筆)の面: 平面 = 薄い青 / 押し出した立体 = 壁と同じ色
   sketchFace: new THREE.MeshLambertMaterial({ color: 0xaecbea, side: THREE.DoubleSide }),
-  sketchSolid: new THREE.MeshLambertMaterial({ color: 0xd8d2c4 })
+  sketchSolid: new THREE.MeshLambertMaterial({ color: 0xf5f5f4 })
 }
 
 // ---------------- マテリアル(仕上げ): Canvas でテクスチャを生成(外部画像なし) ----------------
@@ -703,7 +703,7 @@ export class View3D {
       if (prism) {
         if (s.mode === 'face') this.solidHL.showFace(prism, s.face, 'sel')
         else if (s.mode === 'edges') {
-          this.solidHL.showEdges(prism, s.face)
+          this.solidHL.showEdges(prism, s.face, this.solidEdgeHover)
           if (this.solidEdgeHover !== null) {
             const e = edgesOfFace(prism, s.face)[this.solidEdgeHover]
             if (e) this.solidHL.showEdge(e, 'hover')
@@ -928,9 +928,9 @@ export class View3D {
       if (prism) {
         const mkCone = (kind: string, pos: THREE.Vector3, dir: THREE.Vector3): void => {
           const g = new THREE.Group()
-          const white = new THREE.Mesh(new THREE.ConeGeometry(0.10, 0.21, 12),
+          const white = new THREE.Mesh(new THREE.ConeGeometry(0.10 / 1.5, 0.21 / 1.5, 12),
             new THREE.MeshBasicMaterial({ color: 0xffffff, depthTest: false }))
-          const blue = new THREE.Mesh(new THREE.ConeGeometry(0.072, 0.16, 12),
+          const blue = new THREE.Mesh(new THREE.ConeGeometry(0.072 / 1.5, 0.16 / 1.5, 12),
             new THREE.MeshBasicMaterial({ color: 0x2563eb, depthTest: false }))
           white.renderOrder = 998; blue.renderOrder = 999
           g.add(white, blue)

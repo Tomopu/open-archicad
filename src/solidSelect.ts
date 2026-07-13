@@ -94,6 +94,33 @@ export class SolidHighlight {
   })
   private edgeMat = new THREE.LineBasicMaterial({ color: 0x1d4ed8, depthTest: false })
   private edgeHoverMat = new THREE.LineBasicMaterial({ color: 0x60a5fa, linewidth: 2, depthTest: false })
+  // ホバー中に「選ばれていない辺」を少しだけ半透明にして、目的の辺を目立たせる
+  private edgeDimMat = new THREE.LineBasicMaterial({ color: 0x1d4ed8, transparent: true, opacity: 0.28, depthTest: false })
+
+  /**
+   * 太い線を、辺に垂直な断面方向へずらした複数の線で近似する。
+   * WebGL の linewidth は多くの環境で無視されるため、この方法で見かけの太さを出す。
+   */
+  private thickLine(a: THREE.Vector3, b: THREE.Vector3, mat: THREE.LineBasicMaterial, radius: number, order: number): void {
+    const dir = b.clone().sub(a)
+    if (dir.lengthSq() < 1e-9) { return }
+    dir.normalize()
+    const up = Math.abs(dir.y) > 0.9 ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 1, 0)
+    const u = new THREE.Vector3().crossVectors(dir, up).normalize()
+    const v = new THREE.Vector3().crossVectors(dir, u).normalize()
+    // 中心 + 断面 8 方向にずらして、どの視点からでも太く見える擬似チューブ
+    const offs = [new THREE.Vector3()]
+    for (let k = 0; k < 8; k++) {
+      const ang = (k / 8) * Math.PI * 2
+      offs.push(u.clone().multiplyScalar(Math.cos(ang) * radius).addScaledVector(v, Math.sin(ang) * radius))
+    }
+    for (const o of offs) {
+      const g = new THREE.BufferGeometry().setFromPoints([a.clone().add(o), b.clone().add(o)])
+      const ln = new THREE.Line(g, mat)
+      ln.renderOrder = order
+      this.group.add(ln)
+    }
+  }
 
   private faceGeometry(prism: Prism, face: FaceRef): THREE.BufferGeometry {
     const M = 1 / 1000
@@ -121,29 +148,28 @@ export class SolidHighlight {
     m.renderOrder = 992
     this.group.add(m)
   }
-  /** 面を構成する辺をまとめて強調 */
-  showEdges(prism: Prism, face: FaceRef): void {
-    for (const e of edgesOfFace(prism, face)) {
-      const g = new THREE.BufferGeometry().setFromPoints([e.a, e.b])
-      const ln = new THREE.Line(g, this.edgeMat)
-      ln.renderOrder = 993
-      this.group.add(ln)
-    }
+  /**
+   * 面を構成する辺をまとめて強調。
+   * hoverIdx を渡すと、その辺以外を少しだけ半透明にして目的の辺をわかりやすくする。
+   */
+  showEdges(prism: Prism, face: FaceRef, hoverIdx: number | null = null): void {
+    edgesOfFace(prism, face).forEach((e, i) => {
+      const dim = hoverIdx !== null && i !== hoverIdx
+      // 半透明にする辺は細く、強調する辺は太く描く
+      this.thickLine(e.a, e.b, dim ? this.edgeDimMat : this.edgeMat, dim ? 0.003 : 0.009, dim ? 992 : 993)
+    })
   }
-  /** 1 本の辺の強調(hover = 明るく / sel = 濃く+太く見せるため二重) */
+  /** 1 本の辺の強調(hover = 明るく / sel = 濃く+太く見せる擬似チューブ) */
   showEdge(e: SolidEdge, kind: 'hover' | 'sel'): void {
+    if (kind === 'sel') {
+      // 以前の 2 重描き(約 1 本分の太さ)から 2.5 倍相当に太らせる
+      this.thickLine(e.a, e.b, this.edgeMat, 0.01, 994)
+      return
+    }
     const g = new THREE.BufferGeometry().setFromPoints([e.a, e.b])
-    const ln = new THREE.Line(g, kind === 'hover' ? this.edgeHoverMat : this.edgeMat)
+    const ln = new THREE.Line(g, this.edgeHoverMat)
     ln.renderOrder = 994
     this.group.add(ln)
-    if (kind === 'sel') {
-      // 少し持ち上げた重ね描きで太く見せる
-      const g2 = new THREE.BufferGeometry().setFromPoints([
-        e.a.clone().add(new THREE.Vector3(0, 0.004, 0)), e.b.clone().add(new THREE.Vector3(0, 0.004, 0))])
-      const ln2 = new THREE.Line(g2, this.edgeMat)
-      ln2.renderOrder = 994
-      this.group.add(ln2)
-    }
   }
   clear(): void {
     this.group.traverse(o => { if (o instanceof THREE.Mesh || o instanceof THREE.Line) o.geometry.dispose() })

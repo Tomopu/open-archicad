@@ -468,7 +468,11 @@ export class Renderer2D {
       ctx.fillStyle = '#9ca3af'
       ctx.font = `${16 / vp.zoom}px sans-serif`
       ctx.textAlign = 'center'
-      ctx.fillText('壁がありません(立面図は壁から生成されます)', vp.view.x + 4000, vp.view.y + 3000)
+      ctx.textBaseline = 'middle'
+      const cw = this.canvas.clientWidth || 800, ch = this.canvas.clientHeight || 600
+      ctx.fillText('壁がありません(立面図は壁から生成されます)',
+        vp.view.x + cw / (2 * vp.zoom), vp.view.y + ch / (2 * vp.zoom))
+      ctx.textBaseline = 'alphabetic'
       return
     }
     const opens = this.elevOpenings()

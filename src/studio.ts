@@ -373,7 +373,7 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
       if (prism) {
         if (solidSelS.mode === 'face') solidHL.showFace(prism, solidSelS.face, 'sel')
         else if (solidSelS.mode === 'edges') {
-          solidHL.showEdges(prism, solidSelS.face)
+          solidHL.showEdges(prism, solidSelS.face, solidEdgeHoverS)
           if (solidEdgeHoverS !== null) {
             const e = edgesOfFace(prism, solidSelS.face)[solidEdgeHoverS]
             if (e) solidHL.showEdge(e, 'hover')
@@ -544,9 +544,9 @@ export function openStudio(onSave: (ent: CustomE, name: string) => void, initial
       if (prism) {
         const mkCone = (kind: string, pos: THREE.Vector3, dir: THREE.Vector3): void => {
           const g = new THREE.Group()
-          const white = new THREE.Mesh(new THREE.ConeGeometry(0.10, 0.21, 12),
+          const white = new THREE.Mesh(new THREE.ConeGeometry(0.10 / 1.5, 0.21 / 1.5, 12),
             new THREE.MeshBasicMaterial({ color: 0xffffff, depthTest: false }))
-          const blue = new THREE.Mesh(new THREE.ConeGeometry(0.072, 0.16, 12),
+          const blue = new THREE.Mesh(new THREE.ConeGeometry(0.072 / 1.5, 0.16 / 1.5, 12),
             new THREE.MeshBasicMaterial({ color: 0x2563eb, depthTest: false }))
           white.renderOrder = 998; blue.renderOrder = 999
           g.add(white, blue)
